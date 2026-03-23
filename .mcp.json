@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "nubra-mcp": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "./run_stdio.ps1"
+      ]
+    }
+  }
+}

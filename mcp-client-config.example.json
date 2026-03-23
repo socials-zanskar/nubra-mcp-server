@@ -1,0 +1,17 @@
+{
+  "servers": {
+    "nubra-mcp-http": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8000/mcp"
+    },
+    "nubra-mcp-stdio": {
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "./run_stdio.ps1"
+      ]
+    }
+  }
+}
