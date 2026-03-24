@@ -1,8 +1,12 @@
-fastapi>=0.110.0
-mcp>=1.0.0
-nubra-sdk
-pandas>=2.0.0
-pydantic>=2.6.0
-requests>=2.31.0
+--extra-index-url https://test.pypi.org/simple/
+fastapi>=0.135.1,<0.136
+mcp>=1.26.0,<1.27
+matplotlib>=3.10.0,<3.11
+nubra-talib==0.1.4
+nubra-sdk==0.4.0
+pandas>=2.2.0,<3.1
+pydantic>=2.12.5,<2.13
+requests>=2.31.0,<3
 TA-Lib==0.6.8
-uvicorn>=0.30.0
+uvicorn>=0.42.0,<0.43
+vectorbt>=0.28.4,<0.29

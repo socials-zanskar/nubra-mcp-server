@@ -6,3 +6,11 @@ __pycache__/
 auth_state.json
 auth_data.db.*
 *.log
+artifacts/
+build/
+dist/
+dist_pypi/
+dist_pypi_011/
+dist_verify/
+package/dist_pkg/
+*.egg-info/

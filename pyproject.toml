@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nubra-mcp"
+version = "0.1.1"
+description = "Nubra MCP server for Codex and other MCP clients"
+readme = "package/README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+  { name = "Nubra MCP Maintainers" }
+]
+dependencies = [
+  "fastapi>=0.135.1,<0.136",
+  "mcp>=1.26.0,<1.27",
+  "matplotlib>=3.10.0,<3.11",
+  "nubra-sdk==0.4.0",
+  "pandas>=2.2.0,<3.1",
+  "pydantic>=2.12.5,<2.13",
+  "requests>=2.31.0,<3",
+  "TA-Lib==0.6.8",
+  "uvicorn>=0.42.0,<0.43",
+]
+
+[project.optional-dependencies]
+indicators = [
+  "nubra-talib==0.1.4",
+]
+backtest = [
+  "vectorbt>=0.28.4,<0.29",
+]
+full = [
+  "nubra-talib==0.1.4",
+  "vectorbt>=0.28.4,<0.29",
+]
+
+[project.scripts]
+nubra-mcp = "nubra_mcp_cli:main"
+
+[tool.setuptools]
+py-modules = ["config", "nubra_client", "nubra_mcp_cli", "server"]
+
+[tool.setuptools.packages.find]
+include = ["tools"]
