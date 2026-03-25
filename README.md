@@ -1,145 +1,96 @@
-﻿# Nubra MCP Server
+# Nubra MCP Server
 
 This repository is the main GitHub/source repository for the Nubra MCP server.
 
-It is optimized for the smooth local Codex folder-based flow:
+It provides authentication, instrument lookup, quotes, historical data, options analytics, portfolio and account tools, report generation, screening utilities, backtesting, and order placement through `UAT`.
 
-1. clone or download the repo
-2. run the bootstrap script
-3. open the folder in Codex
-4. let Codex discover the MCP from `.mcp.json`
-5. start using Nubra tools in chat
+## Setup and Start
 
-If you want the smoothest source-based experience with the full local feature set, this is the recommended path.
+Follow the steps below to run the MCP locally.
 
-## What This Repo Provides
+### 1. Prerequisites
 
-- authentication tools
-- instrument lookup and ref-id resolution
-- quotes and historical data
-- portfolio, holdings, funds, and positions
-- options analytics and risk helpers
-- HTML and image report generation
-- CSV export workflows
-- indicator tooling in repo mode
-- backtesting in repo mode
-- UAT-only trading tools with strict guardrails
+Ensure the following are available:
 
-## Recommended GitHub Flow for Codex
+- Python 3.11
+- PowerShell
+- network access to install Python dependencies
 
-### 1. Clone the repo
+### 2. Clone the repository
 
 ```powershell
 git clone https://github.com/socials-zanskar/nubra-mcp-server.git
 cd nubra-mcp-server
 ```
 
-### 2. Bootstrap the repo
+### 3. Bootstrap the environment
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 ```
 
-This creates:
+This script performs the following actions:
+
+- creates `.venv` if it does not exist
+- upgrades `pip`
+- installs packages from `requirements.txt`
+- creates `.env` from `.env.example` if `.env` is missing
+
+After this step, the repository should contain:
 
 - `.venv`
-- `.env` from `.env.example` if needed
-- the local dependency environment for the repo flow
+- `.env`
 
-### 3. Fill in `.env`
+### 4. Configure `.env`
 
-Local repo users should edit `.env` and provide:
+Edit `.env` and set the required values:
 
 ```env
 PHONE=
 MPIN=
 NUBRA_ENV=UAT
 NUBRA_DEFAULT_EXCHANGE=NSE
+LOG_LEVEL=INFO
+HOST=127.0.0.1
+PORT=8000
+MCP_PATH=/mcp
+AUTH_STATE_FILE=auth_state.json
 ```
 
-### 4. Open the repo folder in Codex
+Recommended settings:
 
-Open the cloned `nubra-mcp-server` folder directly in Codex.
+- start with `NUBRA_ENV=UAT`
+- keep `HOST=127.0.0.1`
+- keep `MCP_PATH=/mcp` unless you need a custom path
 
-Important:
+### 5. Start the MCP
 
-- open the main repo folder
-- avoid stale worktrees when testing the latest version
+For MCP clients that use stdio:
 
-### 5. Reload the workspace
+```powershell
+.\run_stdio.ps1
+```
 
-Codex should detect `.mcp.json` automatically.
+For local HTTP testing:
 
-That file launches `run_stdio.ps1`, so the user should not need to manually add the MCP if they are using the GitHub folder flow.
+```powershell
+.\run_http.ps1
+```
 
-### 6. Start using the MCP
+Equivalent direct commands:
 
-Example first prompt:
+```powershell
+python server.py --transport stdio
+python server.py --transport streamable-http
+python server.py --transport sse
+```
 
-- `Use nubra mcp and check auth status`
+### 6. Verify the server
 
-If login is required, the intended flow is:
+When using HTTP transport, the default local endpoints are:
 
-1. phone number
-2. OTP
-3. MPIN
-
-## Why the GitHub Folder Flow Is Smooth
-
-This repo keeps the Codex folder-based experience intentionally simple:
-
-- no global registration is required for repo users
-- `.mcp.json` lives in the repo
-- `run_stdio.ps1` is already wired
-- `bootstrap.ps1` prepares the environment
-
-That makes it feel much closer to:
-
-- open folder
-- connect MCP
-- use it
-
-## UAT Trading Guardrails
-
-Trading actions are enabled only in `UAT`.
-
-Allowed in `UAT`:
-
-- `preview_uat_order`
-- `place_uat_order`
-- `modify_uat_order`
-- `cancel_uat_order`
-- `square_off_uat_position`
-- `place_uat_options_strategy`
-- `place_uat_named_option_strategy`
-
-Blocked in `PROD`:
-
-- all order placement
-- all modify/cancel actions
-- all square-off actions
-- all strategy execution actions
-
-Recommended flow:
-
-1. preview the order
-2. show the order preview table
-3. confirm
-4. place the order
-
-## Repo-Mode Optional Tooling
-
-This GitHub/source flow keeps the full local stack, including indicator and backtest tooling.
-
-## Repo Structure
-
-- `server.py`: MCP entrypoint
-- `config.py`: config loading and user-home support
-- `nubra_client.py`: service logic
-- `tools/`: tool registration modules
-- `tests/`: test suite
-
-## Local Validation
+- health: `http://127.0.0.1:8000/health`
+- mcp: `http://127.0.0.1:8000/mcp`
 
 Import smoke test:
 
@@ -153,15 +104,80 @@ Run tests:
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-## Public Safety Notes
+## MCP Client Integration
 
-Do not commit:
+This repository includes project-local MCP configuration in `.mcp.json`.
 
-- `.env`
-- `auth_state.json`
-- `artifacts/`
-- build outputs
-- local package outputs
+Standard repo-based setup:
 
-Local build outputs such as `dist/`, `build/`, and `*.egg-info/` are ignored.
+1. Open the `nubra-mcp-server` folder in your MCP client.
+2. Run `.\bootstrap.ps1`.
+3. Fill in `.env`.
+4. Allow the client to start `.\run_stdio.ps1` through `.mcp.json`.
 
+For clients that require manual registration, use one of the following:
+
+- `mcp-client-config.example.json`
+- or the HTTP endpoint `http://127.0.0.1:8000/mcp` after starting `.\run_http.ps1`
+
+## Authentication
+
+Protected tools should use the following flow:
+
+1. call `auth_status`
+2. if login is required, ask for phone number
+3. call `begin_auth_flow`
+4. ask for OTP and call `verify_otp`
+5. ask for MPIN and call `verify_mpin`
+6. continue with the original request
+
+Authentication uses the OTP -> MPIN flow.
+
+## What This Repo Provides
+
+The server includes tools for:
+
+- authentication and session handling
+- instrument search and ref-id resolution
+- quotes and historical market data
+- option chain analytics and Greeks
+- funds, holdings, positions, and portfolio summaries
+- HTML and image report generation
+- CSV export workflows
+- screening and indicator-based tooling
+- backtesting utilities
+- order placement through `UAT`
+
+For `PROD`, order placement is temporarily blocked. Other supported operations continue to work.
+
+## Repo Structure
+
+- `server.py`: MCP entrypoint
+- `config.py`: configuration loading
+- `nubra_client.py`: Nubra client and service logic
+- `tools/`: MCP tool registration modules
+- `tests/`: test suite
+- `bootstrap.ps1`: setup script
+- `run_stdio.ps1`: stdio launcher
+- `run_http.ps1`: HTTP launcher
+
+## First Use
+
+Common tasks after startup include:
+
+- check authentication status
+- search for an instrument
+- get the current price for a symbol
+- fetch historical data
+- review option chain data
+- generate a portfolio report
+
+Example first prompt:
+
+- `Use nubra mcp and check auth status`
+
+## Local Notes
+
+- start with `UAT` when validating setup and workflows
+- keep `.env`, auth state files, and local artifacts out of source control
+- build outputs such as `dist/`, `build/`, and `*.egg-info/` should remain uncommitted
