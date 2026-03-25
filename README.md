@@ -1,16 +1,16 @@
-# Nubra MCP Server
+﻿# Nubra MCP Server
 
-This is the main GitHub repository for the Nubra MCP server.
+This repository is the main GitHub/source repository for the Nubra MCP server.
 
-It is optimized for the smooth local developer and power-user flow:
+It is optimized for the smooth local Codex folder-based flow:
 
 1. clone or download the repo
 2. run the bootstrap script
 3. open the folder in Codex
-4. let Codex discover the MCP from [`.mcp.json`](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\.mcp.json)
+4. let Codex discover the MCP from `.mcp.json`
 5. start using Nubra tools in chat
 
-If you want the easiest source-based setup with full local features, this is the recommended path.
+If you want the smoothest source-based experience with the full local feature set, this is the recommended path.
 
 ## What This Repo Provides
 
@@ -19,41 +19,13 @@ If you want the easiest source-based setup with full local features, this is the
 - quotes and historical data
 - portfolio, holdings, funds, and positions
 - options analytics and risk helpers
-- HTML/image report generation
+- HTML and image report generation
 - CSV export workflows
-- `nubra-talib` indicator tooling in repo mode
-- `vectorbt` backtesting in repo mode
+- indicator tooling in repo mode
+- backtesting in repo mode
 - UAT-only trading tools with strict guardrails
 
-## Two User Paths
-
-### 1. GitHub / source flow
-
-Best for:
-
-- developers
-- contributors
-- users who want the smoothest Codex folder-based experience
-- users who want the full local feature set, including repo-installed optional tooling
-
-### 2. PyPI / package flow
-
-Best for:
-
-- users who want a lighter package install
-- users who want to register Nubra MCP globally in Codex
-
-The PyPI/package build now lives under:
-
-- [package](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\package)
-
-Its package-specific instructions are in:
-
-- [package/README.md](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\package\README.md)
-
 ## Recommended GitHub Flow for Codex
-
-This is the flow you said you want to keep smooth for users who download from GitHub.
 
 ### 1. Clone the repo
 
@@ -71,16 +43,12 @@ powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 This creates:
 
 - `.venv`
-- `.env` from [`.env.example`](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\.env.example) if needed
+- `.env` from `.env.example` if needed
 - the local dependency environment for the repo flow
 
 ### 3. Fill in `.env`
 
-Local repo users should edit:
-
-- [`.env`](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\.env)
-
-Typical values:
+Local repo users should edit `.env` and provide:
 
 ```env
 PHONE=
@@ -91,9 +59,7 @@ NUBRA_DEFAULT_EXCHANGE=NSE
 
 ### 4. Open the repo folder in Codex
 
-Open this folder directly in Codex:
-
-- [nubra-mcp-server](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server)
+Open the cloned `nubra-mcp-server` folder directly in Codex.
 
 Important:
 
@@ -102,15 +68,9 @@ Important:
 
 ### 5. Reload the workspace
 
-Codex should detect:
+Codex should detect `.mcp.json` automatically.
 
-- [`.mcp.json`](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\.mcp.json)
-
-That file launches:
-
-- [run_stdio.ps1](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\run_stdio.ps1)
-
-So the user should not need to manually add the MCP if they are using the GitHub folder flow.
+That file launches `run_stdio.ps1`, so the user should not need to manually add the MCP if they are using the GitHub folder flow.
 
 ### 6. Start using the MCP
 
@@ -169,21 +129,15 @@ Recommended flow:
 
 ## Repo-Mode Optional Tooling
 
-The GitHub/source flow keeps the full local stack:
-
-- `nubra-talib` for indicator tools
-- `vectorbt` for backtests
-
-That means the repo flow is still the best experience if the user wants every feature available locally.
+This GitHub/source flow keeps the full local stack, including indicator and backtest tooling.
 
 ## Repo Structure
 
-- [server.py](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\server.py): MCP entrypoint
-- [config.py](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\config.py): config loading and user-home support
-- [nubra_client.py](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\nubra_client.py): service logic
-- [tools](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\tools): tool registration modules
-- [tests](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\tests): test suite
-- [package](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\package): PyPI/package distribution files
+- `server.py`: MCP entrypoint
+- `config.py`: config loading and user-home support
+- `nubra_client.py`: service logic
+- `tools/`: tool registration modules
+- `tests/`: test suite
 
 ## Local Validation
 
@@ -207,19 +161,7 @@ Do not commit:
 - `auth_state.json`
 - `artifacts/`
 - build outputs
-- package outputs
+- local package outputs
 
 Local build outputs such as `dist/`, `build/`, and `*.egg-info/` are ignored.
 
-## Publishing
-
-This repo is the main source repository.
-
-The PyPI package is built from:
-
-- [package](C:\Users\suboth sundar\Desktop\Nubra_API_Full_context\nubra-mcp-server\package)
-
-That separation keeps:
-
-- the GitHub/source flow full-featured
-- the PyPI install path lighter and cleaner
