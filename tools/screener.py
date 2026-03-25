@@ -55,7 +55,7 @@ def register(mcp: Any, service: NubraService) -> None:
         scan_type: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run a reusable watchlist scan such as volume_spike, rsi_threshold, ema_crossover, oi_wall, or return_rank."""
+        """Run a reusable watchlist scan such as volume_spike, volume_breakout, rsi_threshold, ema_crossover, oi_wall, or return_rank."""
         try:
             return _success("scan_watchlist", service.scan_watchlist(symbols=symbols, scan_type=scan_type, params=params))
         except Exception as exc:

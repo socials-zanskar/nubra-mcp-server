@@ -83,7 +83,7 @@ def register(mcp: Any, service: NubraService) -> None:
 
     @mcp.tool()
     def get_quote(symbol: str, levels: int = 5) -> dict[str, Any]:
-        """Get the latest NSE order-book quote for a cash, futures, or options symbol."""
+        """Get the latest Nubra NSE order-book quote for a cash, futures, or options symbol. PROD is recommended for market data access."""
         try:
             return _success("get_quote", service.quote_by_symbol(symbol, exchange=exchange, levels=levels))
         except Exception as exc:
@@ -92,7 +92,7 @@ def register(mcp: Any, service: NubraService) -> None:
 
     @mcp.tool()
     def get_current_price(symbol: str) -> dict[str, Any]:
-        """Get the latest NSE current-price snapshot for a stock, index, or option symbol without requiring order-book depth."""
+        """Get the latest Nubra NSE current-price snapshot for a stock, index, or option symbol without requiring order-book depth. PROD is recommended for market data access."""
         try:
             return _success("get_current_price", service.current_price_by_symbol(symbol, exchange=exchange))
         except Exception as exc:
@@ -101,7 +101,7 @@ def register(mcp: Any, service: NubraService) -> None:
 
     @mcp.tool()
     def get_yesterday_change(symbol: str) -> dict[str, Any]:
-        """Use this when a user asks how much an NSE stock, index, or option changed over yesterday or from the previous close."""
+        """Use this when a user asks how much an NSE stock, index, or option changed over yesterday or from the previous close. PROD is recommended for market data access."""
         try:
             return _success("get_yesterday_change", service.yesterday_change(symbol, exchange=exchange))
         except Exception as exc:

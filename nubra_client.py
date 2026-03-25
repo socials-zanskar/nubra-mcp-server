@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -119,6 +120,28 @@ PAISE_PRICE_KEYS = {
     "max_prate",
     "brokerage",
     "underlying_prev_close",
+    "start_of_day_funds",
+    "net_margin_available",
+    "total_margin_blocked",
+    "mtm_deriv",
+    "mtm_eq_iday_cnc",
+    "mtm_eq_delivery",
+    "invested_amount",
+    "invested_value",
+    "current_value",
+    "market_value",
+    "margin_benefit",
+    "net_pnl",
+    "available_funds",
+    "blocked_margin",
+    "used_margin",
+    "utilised_margin",
+    "available_balance",
+    "cash_balance",
+    "collateral_value",
+    "ledger_balance",
+    "span_margin",
+    "exposure_margin",
 }
 
 PERCENT_KEYS = {"ltpchg", "last_traded_price_change", "pnl_chg", "total_pnl_chg"}
@@ -253,6 +276,42 @@ def convert_paise_to_rupees(payload: Any, *, key: str | None = None, parent_key:
     if _is_price_series(parent_key, key or ""):
         return _convert_paise_value(payload)
     return payload
+
+
+def _format_rupees(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return f"Rs. {float(value):,.2f}"
+
+
+def add_rupee_display_fields(payload: Any, *, key: str | None = None, parent_key: str | None = None) -> Any:
+    if isinstance(payload, dict):
+        output: dict[str, Any] = {}
+        for item_key, item_value in payload.items():
+            converted_value = add_rupee_display_fields(item_value, key=item_key, parent_key=key)
+            output[item_key] = converted_value
+            if _is_price_series(key, item_key):
+                display_value = _format_rupees(converted_value)
+                if display_value is not None:
+                    output[f"{item_key}_display"] = display_value
+        return output
+    if isinstance(payload, list):
+        return [add_rupee_display_fields(item, key=key, parent_key=parent_key) for item in payload]
+    return payload
+
+
+def normalize_nubra_payload(payload: Any) -> Any:
+    return add_ist_time_fields(add_rupee_display_fields(convert_paise_to_rupees(payload)))
+
+
+def _with_display_fields(row: dict[str, Any], price_keys: list[str]) -> dict[str, Any]:
+    output = dict(row)
+    for key in price_keys:
+        if key in output:
+            display_value = _format_rupees(output.get(key))
+            if display_value is not None:
+                output[f"{key}_display"] = display_value
+    return output
 
 
 def _ns_epoch_to_ist(value: int | float) -> str:
@@ -449,6 +508,7 @@ class NubraClient:
         self.settings = settings
         self.state_file = settings.auth_state_path
         self.state = self._load_state()
+        self._session_mpin: str | None = None
         self._instrument_cache: dict[str, list[dict[str, Any]]] = {}
         self._index_master_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._historical_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -582,6 +642,7 @@ class NubraClient:
     def auth_status(self) -> dict[str, Any]:
         session_active = self._probe_session()
         return {
+            "intro_message": "Connected to nubra-mcp. Authentication, market data, analytics, and environment switching are available.",
             "authenticated": self.state.authenticated,
             "session_active": session_active,
             "requires_login": not session_active,
@@ -592,6 +653,8 @@ class NubraClient:
             "has_temp_token": bool(self.state.temp_token),
             "has_auth_token": bool(self.state.auth_token),
             "has_session_token": bool(self.state.session_token),
+            "saved_mpin_available": bool(self.settings.mpin),
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage. Use UAT for order placement testing.",
             "agent_guidance": (
                 "Before using protected tools, call auth_status. If requires_login is true, "
                 "ask for phone number, then OTP, then MPIN, and call send_otp, verify_otp, verify_mpin in that order."
@@ -602,13 +665,33 @@ class NubraClient:
         env = environment.strip().upper()
         if env not in {"PROD", "UAT"}:
             raise NubraAPIError("Environment must be PROD or UAT")
-        self.state = AuthState(environment=env, phone=self.state.phone, device_id=self.state.device_id)
+        previous_environment = self.state.environment
+        had_active_session = bool(
+            self.state.session_token or self.state.auth_token or self.state.temp_token or self.state.authenticated
+        )
+        phone = self.state.phone or self.settings.phone or None
+        device_id = self.state.device_id
+        if had_active_session:
+            try:
+                self.logout()
+            except Exception:
+                logger.info("Environment switch could not complete remote logout; clearing local auth state.")
+        self.state = AuthState(environment=env, phone=phone, device_id=device_id)
         self._instrument_cache.clear()
         self._historical_cache.clear()
         self._last_auth_probe_at = None
         self._last_auth_probe_ok = False
         self._save_state()
-        return self.auth_status()
+        payload = self.auth_status()
+        payload.update(
+            {
+                "previous_environment": previous_environment,
+                "session_reset": had_active_session,
+                "saved_mpin_available": bool(self.settings.mpin),
+                "next_step": "send_otp",
+            }
+        )
+        return payload
 
     def send_otp(self, phone: str | None = None, environment: str | None = None) -> dict[str, Any]:
         if environment:
@@ -649,6 +732,7 @@ class NubraClient:
             "environment": self.state.environment,
             "phone": self.state.phone,
             "device_id": self._device_id(),
+            "saved_mpin_available": bool(self.settings.mpin),
             "next_step": "verify_otp",
         }
 
@@ -690,6 +774,7 @@ class NubraClient:
             "message": "OTP verified. Ask the user for MPIN and call verify_mpin next.",
             "environment": self.state.environment,
             "phone": self.state.phone,
+            "saved_mpin_available": bool(self.settings.mpin),
             "next_step": "verify_mpin",
         }
 
@@ -727,8 +812,98 @@ class NubraClient:
         environment = self.state.environment
         self.state = AuthState(environment=environment, phone=phone)
         self._instrument_cache.clear()
+        self._historical_cache.clear()
+        self._last_auth_probe_at = None
+        self._last_auth_probe_ok = False
         self._save_state()
         return {"message": "Logged out.", "environment": environment}
+
+    def switch_environment_and_send_otp(self, environment: str, phone: str | None = None) -> dict[str, Any]:
+        status = self.set_environment(environment)
+        target_phone = (phone or status.get("phone") or self.settings.phone).strip()
+        if not target_phone:
+            raise NubraAPIError("Phone number is required to start login after switching environment.")
+        otp_payload = self.send_otp(phone=target_phone)
+        return {
+            "message": f"Environment switched to {otp_payload['environment']} and OTP sent.",
+            "previous_environment": status.get("previous_environment"),
+            "environment": otp_payload["environment"],
+            "phone": otp_payload["phone"],
+            "device_id": otp_payload["device_id"],
+            "saved_mpin_available": bool(self.settings.mpin),
+            "current_step": "otp_sent",
+            "next_step": "verify_otp",
+        }
+
+    def verify_otp_with_saved_mpin(self, otp: str, phone: str | None = None) -> dict[str, Any]:
+        effective_mpin = (self._session_mpin or self.settings.mpin).strip()
+        if not effective_mpin:
+            raise NubraAPIError("Saved MPIN not available in settings. Use verify_otp and verify_mpin separately.")
+        otp_payload = self.verify_otp(otp=otp, phone=phone)
+        mpin_payload = self.verify_mpin(effective_mpin)
+        self._session_mpin = None
+        return {
+            "message": "OTP and saved MPIN verified. Authentication complete.",
+            "environment": mpin_payload["environment"],
+            "phone": mpin_payload["phone"],
+            "authenticated": True,
+            "used_saved_mpin": True,
+            "otp_step": otp_payload,
+            "mpin_step": mpin_payload,
+            "next_step": "resume_original_task",
+        }
+
+    def connect_nubra_mcp(
+        self,
+        phone: str | None = None,
+        mpin: str | None = None,
+        environment: str = "PROD",
+    ) -> dict[str, Any]:
+        normalized_phone = (phone or "").strip()
+        normalized_mpin = (mpin or "").strip()
+        normalized_environment = environment.strip().upper() if environment else "PROD"
+        if normalized_environment not in {"PROD", "UAT"}:
+            raise NubraAPIError("Environment must be PROD or UAT.")
+
+        if not normalized_phone or not normalized_mpin:
+            return {
+                "intro_message": "Connected successfully with nubra mcp.",
+                "message": "Select the environment to log in, then provide your phone number and MPIN.",
+                "current_step": "awaiting_environment_phone_mpin",
+                "next_step": "connect_nubra_mcp",
+                "available_environments": ["PROD", "UAT"],
+                "required_fields": ["environment", "phone", "mpin"],
+                "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
+            }
+
+        self._session_mpin = normalized_mpin
+        otp_payload = self.switch_environment_and_send_otp(environment=normalized_environment, phone=normalized_phone)
+        return {
+            "intro_message": "Connected successfully with nubra mcp.",
+            "message": "OTP sent. Enter the OTP to complete login. The MPIN provided in this session will be reused automatically.",
+            "environment": otp_payload["environment"],
+            "phone": otp_payload["phone"],
+            "device_id": otp_payload["device_id"],
+            "current_step": "otp_sent",
+            "next_step": "complete_connect_with_otp",
+            "available_actions": [
+                "Enter OTP",
+                "Switch to PROD for market data",
+                "Switch to UAT for order placement testing",
+            ],
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
+        }
+
+    def complete_connect_with_otp(self, otp: str, phone: str | None = None) -> dict[str, Any]:
+        payload = self.verify_otp_with_saved_mpin(otp=otp, phone=phone)
+        payload.update(
+            {
+                "intro_message": "Connected successfully with nubra mcp.",
+                "message": f"Logged in successfully to {payload.get('environment')} environment.",
+                "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
+            }
+        )
+        return payload
 
     def _ensure_authenticated(self) -> None:
         if not self.state.session_token:
@@ -826,7 +1001,7 @@ class NubraClient:
             params={"levels": levels},
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_current_price(self, symbol: str, *, exchange: str = "NSE") -> dict[str, Any]:
         exchange_name = exchange.strip().upper()
@@ -839,7 +1014,7 @@ class NubraClient:
             params=params or None,
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_option_chain(self, symbol: str, *, exchange: str = "NSE", expiry: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"exchange": exchange.upper()}
@@ -851,7 +1026,7 @@ class NubraClient:
             params=params,
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_historical_data(self, query: HistoricalQuery) -> dict[str, Any]:
         query_payload = query.model_dump()
@@ -868,6 +1043,7 @@ class NubraClient:
             combined_results.extend(batch_result.get("result") or [])
 
         return {
+            "data_source": "nubra",
             "market_time": market_time,
             "message": message or "charts",
             "result": combined_results,
@@ -896,7 +1072,7 @@ class NubraClient:
                 json_body={"query": [api_payload]},
                 headers=self._headers(use_session_token=True),
             )
-            converted_payload = add_ist_time_fields(convert_paise_to_rupees(raw_payload))
+            converted_payload = normalize_nubra_payload(raw_payload)
             market_time = converted_payload.get("market_time")
             message = converted_payload.get("message")
             result_list = converted_payload.get("result") or []
@@ -936,6 +1112,53 @@ class NubraClient:
             "symbol": symbol,
         }
         return json.dumps(parts, sort_keys=True)
+
+    def _resolve_sdk_environment(self, environment: str | None = None) -> str:
+        effective = (environment or self.state.environment or self.settings.environment).strip().upper()
+        if effective not in {"PROD", "UAT"}:
+            raise NubraAPIError("Environment must be PROD or UAT for SDK order placement.")
+        return effective
+
+    def _require_uat_trading(self, environment: str | None = None) -> str:
+        effective = self._resolve_sdk_environment(environment)
+        if effective != "UAT":
+            raise NubraAPIError(UAT_TRADING_ONLY_MESSAGE)
+        return effective
+
+    def _get_sdk_clients(self, environment: str | None = None) -> tuple[Any, Any, Any, dict[str, Any]]:
+        try:
+            from nubra_python_sdk.marketdata.market_data import MarketData
+            from nubra_python_sdk.refdata.instruments import InstrumentData
+            from nubra_python_sdk.start_sdk import InitNubraSdk, NubraEnv
+            from nubra_python_sdk.trading.trading_data import NubraTrader
+            from nubra_python_sdk.trading.trading_enum import DeliveryTypeEnum, ExchangeEnum, OrderSideEnum, PriceTypeEnumV2
+        except Exception as exc:
+            raise NubraAPIError(f"nubra-python-sdk import failed: {exc}") from exc
+
+        effective_environment = self._resolve_sdk_environment(environment)
+        sdk_env = NubraEnv.PROD if effective_environment == "PROD" else NubraEnv.UAT
+        nubra = InitNubraSdk(sdk_env, env_creds=True)
+        instruments = InstrumentData(nubra)
+        trade = NubraTrader(nubra, version="V2")
+        market_data = MarketData(nubra)
+        enums = {
+            "OrderSideEnum": OrderSideEnum,
+            "DeliveryTypeEnum": DeliveryTypeEnum,
+            "PriceTypeEnumV2": PriceTypeEnumV2,
+            "ExchangeEnum": ExchangeEnum,
+        }
+        return instruments, trade, market_data, enums
+
+    def _sdk_to_plain(self, value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return self._sdk_to_plain(value.model_dump())
+        if isinstance(value, dict):
+            return {key: self._sdk_to_plain(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._sdk_to_plain(item) for item in value]
+        if hasattr(value, "__dict__") and not isinstance(value, (str, bytes, int, float, bool)):
+            return self._sdk_to_plain(vars(value))
+        return value
 
     def place_order(self, order: OrderRequest) -> dict[str, Any]:
         effective_environment = self._require_uat_trading()
@@ -1005,7 +1228,7 @@ class NubraClient:
             params=params or None,
             headers=self._headers(use_session_token=True),
         )
-        converted = add_ist_time_fields(convert_paise_to_rupees(payload))
+        converted = normalize_nubra_payload(payload)
         if not isinstance(converted, list):
             raise NubraAPIError("Unexpected orders response format", details=converted)
         return converted
@@ -1016,7 +1239,7 @@ class NubraClient:
             "portfolio/positions",
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_margin(self, payload_body: dict[str, Any]) -> dict[str, Any]:
         payload = self._request(
@@ -1025,7 +1248,7 @@ class NubraClient:
             json_body=payload_body,
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_holdings(self) -> dict[str, Any]:
         payload = self._request(
@@ -1033,7 +1256,7 @@ class NubraClient:
             "portfolio/holdings",
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
     def get_funds(self) -> dict[str, Any]:
         payload = self._request(
@@ -1041,7 +1264,7 @@ class NubraClient:
             "portfolio/user_funds_and_margin",
             headers=self._headers(use_session_token=True),
         )
-        return add_ist_time_fields(convert_paise_to_rupees(payload))
+        return normalize_nubra_payload(payload)
 
 
 class NubraService:
@@ -1120,11 +1343,11 @@ class NubraService:
             {"field": "Quantity", "value": order.order_qty},
             {"field": "Order Type", "value": order.order_type},
             {"field": "Price Type", "value": order.price_type},
-            {"field": "Order Price", "value": effective_price},
+            {"field": "Order Price", "value": _format_rupees(effective_price) if effective_price is not None else None},
             {"field": "Product", "value": order.order_delivery_type.replace("ORDER_DELIVERY_TYPE_", "")},
             {"field": "Validity", "value": order.validity_type},
             {"field": "Tag", "value": order.tag or "-"},
-            {"field": "Current Price", "value": current_price},
+            {"field": "Current Price", "value": _format_rupees(current_price) if current_price is not None else None},
         ]
         return {
             "environment": environment,
@@ -1134,8 +1357,10 @@ class NubraService:
             "requested_price_type": original_price_type,
             "effective_price_type": order.price_type,
             "effective_order_price": order.order_price,
+            "effective_order_price_display": _format_rupees(order.order_price),
             "converted_market_to_limit": converted_market_to_limit,
             "current_price": current_price,
+            "current_price_display": _format_rupees(current_price),
             "warnings": warnings,
             "preview_columns": ["field", "value"],
             "preview_rows": preview_rows,
@@ -1188,6 +1413,12 @@ class NubraService:
     def set_environment(self, environment: str) -> dict[str, Any]:
         return self.client.set_environment(environment)
 
+    def connect_nubra_mcp(self, phone: str | None = None, mpin: str | None = None, environment: str = "PROD") -> dict[str, Any]:
+        return self.client.connect_nubra_mcp(phone=phone, mpin=mpin, environment=environment)
+
+    def switch_environment_and_send_otp(self, environment: str, phone: str | None = None) -> dict[str, Any]:
+        return self.client.switch_environment_and_send_otp(environment=environment, phone=phone)
+
     def send_otp(self, phone: str | None = None, environment: str | None = None) -> dict[str, Any]:
         return self.client.send_otp(phone=phone, environment=environment)
 
@@ -1199,6 +1430,12 @@ class NubraService:
 
     def verify_mpin(self, mpin: str) -> dict[str, Any]:
         return self.client.verify_mpin(mpin)
+
+    def verify_otp_with_saved_mpin(self, otp: str, phone: str | None = None) -> dict[str, Any]:
+        return self.client.verify_otp_with_saved_mpin(otp=otp, phone=phone)
+
+    def complete_connect_with_otp(self, otp: str, phone: str | None = None) -> dict[str, Any]:
+        return self.client.complete_connect_with_otp(otp=otp, phone=phone)
 
     def logout(self) -> dict[str, Any]:
         return self.client.logout()
@@ -1212,6 +1449,7 @@ class NubraService:
     ) -> dict[str, Any]:
         orders = self.client.get_orders(live=live, executed=executed, tag=tag)
         return {
+            "data_source": "nubra",
             "count": len(orders),
             "live": live,
             "executed": executed,
@@ -1432,6 +1670,8 @@ class NubraService:
         instrument = self.client.resolve_symbol(symbol, exchange=exchange)
         quote = self.client.get_quote(instrument.ref_id, levels=levels)
         return {
+            "data_source": "nubra",
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
             "instrument": instrument.model_dump(),
             "quote": quote.get("orderBook", quote),
         }
@@ -1445,12 +1685,18 @@ class NubraService:
             instrument = None
 
         current_price = self.client.get_current_price(normalized_symbol, exchange=exchange)
+        current_price_value = current_price.get("price")
+        previous_close_value = current_price.get("prev_close")
         return {
+            "data_source": "nubra",
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
             "symbol": normalized_symbol,
             "exchange": current_price.get("exchange", exchange.upper()),
             "instrument": instrument,
-            "current_price": current_price.get("price"),
-            "previous_close": current_price.get("prev_close"),
+            "current_price": current_price_value,
+            "current_price_display": _format_rupees(current_price_value),
+            "previous_close": previous_close_value,
+            "previous_close_display": _format_rupees(previous_close_value),
             "percent_change": current_price.get("change"),
             "raw": current_price,
         }
@@ -1476,6 +1722,7 @@ class NubraService:
         payload.update(
             {
                 "absolute_change": absolute_change,
+                "absolute_change_display": _format_rupees(absolute_change),
                 "direction": direction,
                 "reference_note": "Change is measured against the previous trading session close returned by Nubra current price.",
             }
@@ -1486,11 +1733,15 @@ class NubraService:
         chain = self.client.get_option_chain(symbol, exchange=exchange, expiry=expiry)
         payload = chain.get("chain", {})
         return {
+            "data_source": "nubra",
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
             "asset": payload.get("asset", symbol.upper()),
             "exchange": payload.get("exchange", exchange),
             "expiry": payload.get("expiry"),
             "atm": payload.get("atm"),
+            "atm_display": _format_rupees(payload.get("atm")),
             "current_price": payload.get("cp"),
+            "current_price_display": _format_rupees(payload.get("cp")),
             "available_expiries": payload.get("all_expiries", []),
             "calls": payload.get("ce", []),
             "puts": payload.get("pe", []),
@@ -2649,7 +2900,8 @@ class NubraService:
             "close_positions": positions_payload.get("close_positions", []),
         }
         rows = self._build_exposure_rows(holdings=holdings, positions=self._flatten_position_groups(portfolio), group_by=group_by)
-        return {"group_by": group_by, "count": len(rows), "exposures": rows[: max(1, limit)]}
+        exposures = [_with_display_fields(row, ["market_value", "invested_value", "pnl"]) for row in rows[: max(1, limit)]]
+        return {"data_source": "nubra", "group_by": group_by, "count": len(rows), "exposures": exposures}
 
     def get_portfolio_summary(
         self,
@@ -2681,21 +2933,27 @@ class NubraService:
         ranked_pnl_rows: list[dict[str, Any]] = []
         for item in holdings:
             ranked_pnl_rows.append(
-                {
-                    "symbol": str(item.get("symbol") or item.get("displayName") or item.get("asset")).strip().upper(),
-                    "source": "holding",
-                    "pnl": round(_to_float(item.get("net_pnl")), 2),
-                    "market_value": round(self._holding_market_value(item), 2),
-                }
+                _with_display_fields(
+                    {
+                        "symbol": str(item.get("symbol") or item.get("displayName") or item.get("asset")).strip().upper(),
+                        "source": "holding",
+                        "pnl": round(_to_float(item.get("net_pnl")), 2),
+                        "market_value": round(self._holding_market_value(item), 2),
+                    },
+                    ["pnl", "market_value"],
+                )
             )
         for item in positions:
             ranked_pnl_rows.append(
-                {
-                    "symbol": str(item.get("symbol") or item.get("display_name") or item.get("asset")).strip().upper(),
-                    "source": "position",
-                    "pnl": round(_to_float(item.get("pnl")), 2),
-                    "market_value": round(self._position_market_value(item), 2),
-                }
+                _with_display_fields(
+                    {
+                        "symbol": str(item.get("symbol") or item.get("display_name") or item.get("asset")).strip().upper(),
+                        "source": "position",
+                        "pnl": round(_to_float(item.get("pnl")), 2),
+                        "market_value": round(self._position_market_value(item), 2),
+                    },
+                    ["pnl", "market_value"],
+                )
             )
 
         sorted_by_pnl = sorted(ranked_pnl_rows, key=lambda row: row["pnl"], reverse=True)
@@ -2713,16 +2971,24 @@ class NubraService:
         if include_funds and net_margin_available < 0:
             risk_flags.append("Net margin available is negative.")
 
-        return {
-            "account_overview": {
+        account_overview = _with_display_fields(
+            {
                 "holdings_count": len(holdings),
                 "open_positions_count": len(positions),
                 "holdings_value": round(sum(self._holding_market_value(item) for item in holdings), 2),
                 "open_position_market_value": round(sum(self._position_market_value(item) for item in positions), 2),
             },
+            ["holdings_value", "open_position_market_value"],
+        )
+        return {
+            "data_source": "nubra",
+            "account_overview": account_overview,
             "holding_stats": holdings_payload.get("holding_stats", {}),
             "position_stats": positions_payload.get("position_stats", {}),
-            "margin_snapshot": ((funds_payload.get("funds") or {}).get("port_funds_and_margin") or {}),
+            "margin_snapshot": _with_display_fields(
+                ((funds_payload.get("funds") or {}).get("port_funds_and_margin") or {}),
+                ["start_of_day_funds", "net_margin_available", "total_margin_blocked", "mtm_deriv", "mtm_eq_iday_cnc", "mtm_eq_delivery"],
+            ),
             "top_gainers": gainers,
             "top_losers": losers,
             "largest_exposures": exposures[:5],
@@ -2778,18 +3044,21 @@ class NubraService:
                         pass
             total_delta_proxy += delta_proxy
             rows.append(
-                {
-                    "symbol": str(position.get("symbol") or position.get("display_name") or position.get("asset")).strip().upper(),
-                    "ref_id": position.get("ref_id"),
-                    "derivative_type": derivative_type,
-                    "product": position.get("product"),
-                    "qty": qty,
-                    "ltp": ltp,
-                    "pnl": round(_to_float(position.get("pnl")), 2),
-                    "market_value": round(market_value, 2),
-                    "delta_proxy": round(delta_proxy, 4),
-                    "stress_test_estimate": stress_estimate,
-                }
+                _with_display_fields(
+                    {
+                        "symbol": str(position.get("symbol") or position.get("display_name") or position.get("asset")).strip().upper(),
+                        "ref_id": position.get("ref_id"),
+                        "derivative_type": derivative_type,
+                        "product": position.get("product"),
+                        "qty": qty,
+                        "ltp": ltp,
+                        "pnl": round(_to_float(position.get("pnl")), 2),
+                        "market_value": round(market_value, 2),
+                        "delta_proxy": round(delta_proxy, 4),
+                        "stress_test_estimate": stress_estimate,
+                    },
+                    ["ltp", "pnl", "market_value", "stress_test_estimate"],
+                )
             )
 
         largest_loss_positions = sorted(rows, key=lambda row: row["pnl"])[:5]
@@ -2810,6 +3079,7 @@ class NubraService:
             risk_flags.append("Open options exposure is present in the portfolio.")
 
         return {
+            "data_source": "nubra",
             "net_directional_bias": net_directional_bias,
             "delta_proxy_total": round(total_delta_proxy, 4),
             "stress_move_pct": stress_move_pct,
@@ -2934,14 +3204,18 @@ class NubraService:
         total_call_oi = sum(_to_float(leg.get("oi")) for leg in calls)
         total_put_oi = sum(_to_float(leg.get("oi")) for leg in puts)
         return {
+            "data_source": "nubra",
             "symbol": symbol.strip().upper(),
             "exchange": chain.get("exchange", exchange),
             "expiry": chain.get("expiry"),
             "strategy_type": normalized_strategy,
             "underlying_price": current_price,
+            "underlying_price_display": _format_rupees(current_price),
             "atm": atm,
+            "atm_display": _format_rupees(atm),
             "selected_legs": selected_legs,
             "combined_premium": round(sum(_to_float(leg.get("ltp")) for leg in selected_legs), 2),
+            "combined_premium_display": _format_rupees(round(sum(_to_float(leg.get("ltp")) for leg in selected_legs), 2)),
             "oi_context": {
                 "top_call_oi": top_call_oi,
                 "top_put_oi": top_put_oi,
@@ -2978,25 +3252,29 @@ class NubraService:
             total_call_oi = sum(_to_float(leg.get("oi")) for leg in calls)
             total_put_oi = sum(_to_float(leg.get("oi")) for leg in puts)
             comparisons.append(
-                {
-                    "expiry": chain.get("expiry") or expiry,
-                    "atm": chain.get("atm"),
-                    "current_price": chain.get("current_price"),
-                    "atm_iv": round(_to_float(next((leg.get("iv") for leg in calls if leg.get("sp") == chain.get("atm")), 0.0)), 4),
-                    "total_call_oi": total_call_oi,
-                    "total_put_oi": total_put_oi,
-                    "put_call_ratio": round(total_put_oi / max(total_call_oi, 1.0), 4),
-                    "liquidity_summary": {
-                        "call_volume": round(sum(_to_float(leg.get("volume")) for leg in calls), 2),
-                        "put_volume": round(sum(_to_float(leg.get("volume")) for leg in puts), 2),
+                _with_display_fields(
+                    {
+                        "expiry": chain.get("expiry") or expiry,
+                        "atm": chain.get("atm"),
+                        "current_price": chain.get("current_price"),
+                        "atm_iv": round(_to_float(next((leg.get("iv") for leg in calls if leg.get("sp") == chain.get("atm")), 0.0)), 4),
+                        "total_call_oi": total_call_oi,
+                        "total_put_oi": total_put_oi,
+                        "put_call_ratio": round(total_put_oi / max(total_call_oi, 1.0), 4),
+                        "liquidity_summary": {
+                            "call_volume": round(sum(_to_float(leg.get("volume")) for leg in calls), 2),
+                            "put_volume": round(sum(_to_float(leg.get("volume")) for leg in puts), 2),
+                        },
+                        "premium_comparison": {
+                            "top_calls": sorted(calls, key=lambda leg: _to_float(leg.get("oi")), reverse=True)[:top_k_strikes],
+                            "top_puts": sorted(puts, key=lambda leg: _to_float(leg.get("oi")), reverse=True)[:top_k_strikes],
+                        },
                     },
-                    "premium_comparison": {
-                        "top_calls": sorted(calls, key=lambda leg: _to_float(leg.get("oi")), reverse=True)[:top_k_strikes],
-                        "top_puts": sorted(puts, key=lambda leg: _to_float(leg.get("oi")), reverse=True)[:top_k_strikes],
-                    },
-                }
+                    ["atm", "current_price"],
+                )
             )
         return {
+            "data_source": "nubra",
             "symbol": symbol.strip().upper(),
             "exchange": exchange.upper(),
             "expiries_compared": [item.get("expiry") for item in comparisons],
@@ -3079,8 +3357,24 @@ class NubraService:
             )
             ranking = result.get("ranked_symbols", [])
             matches = ranking
+        elif normalized_scan == "volume_breakout":
+            result = self.find_volume_breakouts(
+                symbols,
+                timeframe=str(settings.get("timeframe", "1d")),
+                start_date=str(settings.get("start_date", "")),
+                end_date=str(settings.get("end_date", "")),
+                exchange=exchange,
+                instrument_type=str(settings.get("instrument_type", "STOCK")),
+                breakout_lookback_bars=_to_int(settings.get("breakout_lookback_bars"), 20),
+                volume_lookback_bars=_to_int(settings.get("volume_lookback_bars"), 20),
+                min_volume_spike_ratio=_to_float(settings.get("min_volume_spike_ratio"), 1.5),
+                min_breakout_pct=_to_float(settings.get("min_breakout_pct"), 0.0),
+                require_close_breakout=bool(settings.get("require_close_breakout", True)),
+            )
+            matches = result.get("matches", [])
+            ranking = matches
         else:
-            raise ValueError("scan_type must be one of volume_spike, rsi_threshold, ema_crossover, oi_wall, return_rank.")
+            raise ValueError("scan_type must be one of volume_spike, volume_breakout, rsi_threshold, ema_crossover, oi_wall, return_rank.")
 
         matched_symbols = {str(item.get("symbol") or item.get("underlying") or "").strip().upper() for item in matches if isinstance(item, dict)}
         non_matches = [symbol for symbol in symbols if symbol.strip().upper() not in matched_symbols]
@@ -3152,11 +3446,12 @@ class NubraService:
         if any(row["group"] == "UNTAGGED" for row in tag_summary):
             behavior_flags.append("Some executed orders are untagged.")
         return {
+            "data_source": "nubra",
             "date_from": date_from,
             "date_to": date_to,
             "total_trades": len(filtered_orders),
             "executed_orders": filtered_orders,
-            "tag_summary": tag_summary,
+            "tag_summary": [_with_display_fields(row, ["notional"]) for row in tag_summary],
             "most_traded_symbols": most_traded,
             "estimated_win_rate": None,
             "average_entry_size": round(sum(_to_float(order.get("filled_qty") or order.get("order_qty")) for order in filtered_orders) / max(len(filtered_orders), 1), 4),
@@ -3189,14 +3484,19 @@ class NubraService:
         volume_note = "above_average" if avg_volume is not None and latest_volume is not None and latest_volume > avg_volume else "below_average"
         volatility_pct = round(((float(highs.max()) - float(lows.min())) / max(first_close, 1.0)) * 100.0, 4)
         return {
+            "data_source": "nubra",
             "symbol": symbol.strip().upper(),
             "timeframe": timeframe,
             "trend": trend,
             "period_return_pct": period_return_pct,
             "swing_high": round(float(highs.max()), 2),
+            "swing_high_display": _format_rupees(round(float(highs.max()), 2)),
             "swing_low": round(float(lows.min()), 2),
+            "swing_low_display": _format_rupees(round(float(lows.min()), 2)),
             "support_zone": support_zone,
+            "support_zone_display": _format_rupees(support_zone),
             "resistance_zone": resistance_zone,
+            "resistance_zone_display": _format_rupees(resistance_zone),
             "volatility_note": {"range_pct": volatility_pct, "classification": "high" if volatility_pct >= 8 else "moderate" if volatility_pct >= 4 else "low"},
             "volume_note": {"average_volume": avg_volume, "latest_volume": latest_volume, "classification": volume_note},
         }
@@ -3287,14 +3587,24 @@ class NubraService:
         if include_margin and _to_float(funds.get("mtm_deriv")) < 0:
             cash_pressure_flags.append("Derivative MTM is negative.")
         return {
+            "data_source": "nubra",
             "available_funds": _to_float(funds.get("start_of_day_funds")),
+            "available_funds_display": _format_rupees(_to_float(funds.get("start_of_day_funds"))),
             "blocked_margin": _to_float(funds.get("total_margin_blocked")),
-            "mtm_summary": {
-                "mtm_deriv": _to_float(funds.get("mtm_deriv")),
-                "mtm_eq_iday_cnc": _to_float(funds.get("mtm_eq_iday_cnc")),
-                "mtm_eq_delivery": _to_float(funds.get("mtm_eq_delivery")),
-            },
-            "pledgeable_holdings": sorted(pledgeable_holdings, key=lambda row: row["margin_benefit"], reverse=True),
+            "blocked_margin_display": _format_rupees(_to_float(funds.get("total_margin_blocked"))),
+            "mtm_summary": _with_display_fields(
+                {
+                    "mtm_deriv": _to_float(funds.get("mtm_deriv")),
+                    "mtm_eq_iday_cnc": _to_float(funds.get("mtm_eq_iday_cnc")),
+                    "mtm_eq_delivery": _to_float(funds.get("mtm_eq_delivery")),
+                },
+                ["mtm_deriv", "mtm_eq_iday_cnc", "mtm_eq_delivery"],
+            ),
+            "pledgeable_holdings": sorted(
+                [_with_display_fields(row, ["margin_benefit"]) for row in pledgeable_holdings],
+                key=lambda row: row["margin_benefit"],
+                reverse=True,
+            ),
             "cash_pressure_flags": cash_pressure_flags,
             "margin_risk_flags": cash_pressure_flags,
         }
@@ -3357,14 +3667,18 @@ class NubraService:
 
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "headline_metrics": {
-                "total_market_value": total_market_value,
-                "total_current_pnl": total_current_pnl,
-                "current_open_drawdown": current_open_drawdown,
-                "largest_concentration_pct": concentration_pct,
-                "holdings_count": summary.get("account_overview", {}).get("holdings_count"),
-                "open_positions_count": summary.get("account_overview", {}).get("open_positions_count"),
-            },
+            "data_source": "nubra",
+            "headline_metrics": _with_display_fields(
+                {
+                    "total_market_value": total_market_value,
+                    "total_current_pnl": total_current_pnl,
+                    "current_open_drawdown": current_open_drawdown,
+                    "largest_concentration_pct": concentration_pct,
+                    "holdings_count": summary.get("account_overview", {}).get("holdings_count"),
+                    "open_positions_count": summary.get("account_overview", {}).get("open_positions_count"),
+                },
+                ["total_market_value", "total_current_pnl", "current_open_drawdown"],
+            ),
             "portfolio_summary": summary,
             "risk_report": risk,
             "account_health": health,
@@ -3709,19 +4023,23 @@ class NubraService:
             win_rate_pct = round(_to_float(portfolio.trades.win_rate()) * 100.0, 4)
         except Exception:
             win_rate_pct = None
-        return {
-            "symbol": symbol.strip().upper(),
-            "strategy_type": strategy_type,
-            "timeframe": timeframe,
-            "start_value": start_value,
-            "end_value": end_value,
-            "total_return_pct": total_return_pct,
-            "max_drawdown_pct": max_drawdown_pct,
-            "sharpe_ratio": sharpe_ratio,
-            "trade_count": trade_count,
-            "win_rate_pct": win_rate_pct,
-            "equity_curve_points": int(len(value_series)),
-        }
+        return _with_display_fields(
+            {
+                "data_source": "nubra",
+                "symbol": symbol.strip().upper(),
+                "strategy_type": strategy_type,
+                "timeframe": timeframe,
+                "start_value": start_value,
+                "end_value": end_value,
+                "total_return_pct": total_return_pct,
+                "max_drawdown_pct": max_drawdown_pct,
+                "sharpe_ratio": sharpe_ratio,
+                "trade_count": trade_count,
+                "win_rate_pct": win_rate_pct,
+                "equity_curve_points": int(len(value_series)),
+            },
+            ["start_value", "end_value"],
+        )
 
     def _vectorbt_freq_from_timeframe(self, timeframe: str) -> str:
         mapping = {
@@ -3957,7 +4275,7 @@ class NubraService:
             for key, value in report.items()
             if key != "preview_rows"
         ][:10]
-        payload = {"report_path": str(html_path.resolve()), "summary": report}
+        payload = {"data_source": "nubra", "report_path": str(html_path.resolve()), "summary": report}
         payload.update(
             self._build_file_export_metadata(
                 file_path=html_path,
@@ -4040,6 +4358,7 @@ class NubraService:
         fig.savefig(image_path, bbox_inches="tight")
         plt.close(fig)
         payload = {
+            "data_source": "nubra",
             "image_path": str(image_path.resolve()),
             "summary": self._summarize_backtest_portfolio(portfolio, symbol=symbol, strategy_type=strategy_type, timeframe=timeframe),
         }
@@ -4070,17 +4389,20 @@ class NubraService:
             first_close = float(closes.iloc[0])
             last_close = float(closes.iloc[-1])
             rows.append(
-                {
-                    "symbol": symbol.strip().upper(),
-                    "start_close": round(first_close, 2),
-                    "end_close": round(last_close, 2),
-                    "return_pct": _pct_change(last_close, first_close),
-                    "bars": int(len(df)),
-                    "timeframe": timeframe,
-                }
+                _with_display_fields(
+                    {
+                        "symbol": symbol.strip().upper(),
+                        "start_close": round(first_close, 2),
+                        "end_close": round(last_close, 2),
+                        "return_pct": _pct_change(last_close, first_close),
+                        "bars": int(len(df)),
+                        "timeframe": timeframe,
+                    },
+                    ["start_close", "end_close"],
+                )
             )
         ranked = sorted(rows, key=lambda row: row.get("return_pct") or float("-inf"), reverse=True)
-        return {"timeframe": timeframe, "start_date": start_date, "end_date": end_date, "rows": ranked}
+        return {"data_source": "nubra", "timeframe": timeframe, "start_date": start_date, "end_date": end_date, "rows": ranked}
 
     def rank_symbols_by_return(
         self,
@@ -4101,6 +4423,7 @@ class NubraService:
             instrument_type=instrument_type,
         )
         return {
+            "data_source": "nubra",
             "ranking_metric": "return_pct",
             "timeframe": payload["timeframe"],
             "start_date": payload["start_date"],
@@ -4137,20 +4460,169 @@ class NubraService:
             ratio = None if baseline == 0 else round(latest_volume / baseline, 4)
             if ratio is not None and ratio >= min_spike_ratio:
                 matches.append(
-                    {
-                        "symbol": symbol.strip().upper(),
-                        "latest_volume": latest_volume,
-                        "average_volume": round(baseline, 2),
-                        "spike_ratio": ratio,
-                        "timestamp": str(df["timestamp"].iloc[-1]),
-                    }
+                    _with_display_fields(
+                        {
+                            "symbol": symbol.strip().upper(),
+                            "latest_volume": latest_volume,
+                            "average_volume": round(baseline, 2),
+                            "spike_ratio": ratio,
+                            "timestamp": str(df["timestamp"].iloc[-1]),
+                        },
+                        [],
+                    )
                 )
         matches.sort(key=lambda row: row["spike_ratio"], reverse=True)
         return {
+            "data_source": "nubra",
             "timeframe": timeframe,
             "lookback_bars": lookback_bars,
             "min_spike_ratio": min_spike_ratio,
             "matches": matches,
+        }
+
+    def find_volume_breakouts(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        exchange: str = "NSE",
+        instrument_type: str = "STOCK",
+        breakout_lookback_bars: int = 20,
+        volume_lookback_bars: int = 20,
+        min_volume_spike_ratio: float = 1.5,
+        min_breakout_pct: float = 0.0,
+        require_close_breakout: bool = True,
+    ) -> dict[str, Any]:
+        if breakout_lookback_bars <= 0 or volume_lookback_bars <= 0:
+            raise ValueError("breakout_lookback_bars and volume_lookback_bars must be greater than zero.")
+
+        matches: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        normalized_symbols: list[str] = []
+        seen_symbols: set[str] = set()
+        for symbol in symbols:
+            normalized = symbol.strip().upper()
+            if not normalized or normalized in seen_symbols:
+                continue
+            seen_symbols.add(normalized)
+            normalized_symbols.append(normalized)
+
+        def _load_history(symbol: str) -> tuple[str, pd.DataFrame | None, str | None]:
+            try:
+                df = self._historical_to_df(
+                    symbol,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exchange=exchange,
+                    instrument_type=instrument_type,
+                )
+                return symbol, df, None
+            except Exception as exc:
+                return symbol, None, str(exc)
+
+        history_by_symbol: dict[str, pd.DataFrame] = {}
+        if len(normalized_symbols) <= 1:
+            for symbol in normalized_symbols:
+                item_symbol, df, error = _load_history(symbol)
+                if error or df is None:
+                    rejected.append({"symbol": item_symbol, "reason": "historical_data_fetch_failed", "details": error})
+                    continue
+                history_by_symbol[item_symbol] = df
+        else:
+            max_workers = min(8, len(normalized_symbols))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for item_symbol, df, error in executor.map(_load_history, normalized_symbols):
+                    if error or df is None:
+                        rejected.append({"symbol": item_symbol, "reason": "historical_data_fetch_failed", "details": error})
+                        continue
+                    history_by_symbol[item_symbol] = df
+
+        for symbol in normalized_symbols:
+            df = history_by_symbol.get(symbol)
+            if df is None:
+                continue
+            required_bars = max(breakout_lookback_bars, volume_lookback_bars) + 1
+            if len(df) < required_bars:
+                rejected.append(
+                    {
+                        "symbol": symbol,
+                        "reason": "insufficient_bars",
+                        "required_bars": required_bars,
+                        "available_bars": int(len(df)),
+                    }
+                )
+                continue
+
+            latest = df.iloc[-1]
+            breakout_window = df.iloc[-(breakout_lookback_bars + 1):-1]
+            volume_window = df.iloc[-(volume_lookback_bars + 1):-1]
+
+            latest_close = round(float(latest["close"]), 2)
+            latest_high = round(float(latest["high"]), 2)
+            latest_volume = float(latest["volume"])
+            breakout_level = round(float(breakout_window["high"].max()), 2)
+            average_volume = round(float(volume_window["volume"].mean()), 2)
+            volume_spike_ratio = round(latest_volume / average_volume, 4) if average_volume > 0 else None
+
+            breakout_price = latest_close if require_close_breakout else latest_high
+            breakout_pct = round(((breakout_price - breakout_level) / breakout_level) * 100.0, 4) if breakout_level > 0 else None
+            price_breakout = breakout_price > breakout_level and (breakout_pct is not None and breakout_pct >= min_breakout_pct)
+            volume_confirmed = volume_spike_ratio is not None and volume_spike_ratio >= min_volume_spike_ratio
+
+            row = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": str(latest["timestamp"]),
+                "breakout_level": breakout_level,
+                "breakout_level_display": _format_rupees(breakout_level),
+                "latest_close": latest_close,
+                "latest_close_display": _format_rupees(latest_close),
+                "latest_high": latest_high,
+                "latest_high_display": _format_rupees(latest_high),
+                "latest_volume": latest_volume,
+                "average_volume": average_volume,
+                "volume_spike_ratio": volume_spike_ratio,
+                "breakout_pct": breakout_pct,
+                "price_breakout_confirmed": bool(price_breakout),
+                "volume_breakout_confirmed": bool(volume_confirmed),
+                "strategy_match": bool(price_breakout and volume_confirmed),
+                "confirmation_basis": "close" if require_close_breakout else "high",
+            }
+
+            if row["strategy_match"]:
+                matches.append(row)
+            else:
+                reasons: list[str] = []
+                if not price_breakout:
+                    reasons.append("price_breakout_not_confirmed")
+                if not volume_confirmed:
+                    reasons.append("volume_confirmation_not_met")
+                rejected.append({**row, "reason": ", ".join(reasons) if reasons else "not_matched"})
+
+        matches.sort(
+            key=lambda row: (
+                row.get("breakout_pct") if isinstance(row.get("breakout_pct"), (int, float)) else float("-inf"),
+                row.get("volume_spike_ratio") if isinstance(row.get("volume_spike_ratio"), (int, float)) else float("-inf"),
+            ),
+            reverse=True,
+        )
+
+        return {
+            "data_source": "nubra",
+            "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
+            "strategy": "volume_breakout",
+            "timeframe": timeframe,
+            "breakout_lookback_bars": breakout_lookback_bars,
+            "volume_lookback_bars": volume_lookback_bars,
+            "min_volume_spike_ratio": min_volume_spike_ratio,
+            "min_breakout_pct": min_breakout_pct,
+            "require_close_breakout": require_close_breakout,
+            "matches": matches,
+            "rejected": rejected,
+            "summary": {"match_count": len(matches), "rejected_count": len(rejected)},
         }
 
     def summarize_option_chain(
@@ -4168,22 +4640,28 @@ class NubraService:
         def _top_oi(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ranked = sorted(legs, key=lambda leg: float(leg.get("oi") or 0), reverse=True)[:top_k]
             return [
-                {
-                    "strike_price": leg.get("sp"),
-                    "open_interest": leg.get("oi"),
-                    "volume": leg.get("volume"),
-                    "iv": leg.get("iv"),
-                    "last_traded_price": leg.get("ltp"),
-                }
+                _with_display_fields(
+                    {
+                        "strike_price": leg.get("sp"),
+                        "open_interest": leg.get("oi"),
+                        "volume": leg.get("volume"),
+                        "iv": leg.get("iv"),
+                        "last_traded_price": leg.get("ltp"),
+                    },
+                    ["strike_price", "last_traded_price"],
+                )
                 for leg in ranked
             ]
 
         return {
+            "data_source": "nubra",
             "asset": chain.get("asset"),
             "exchange": chain.get("exchange"),
             "expiry": chain.get("expiry"),
             "atm": chain.get("atm"),
+            "atm_display": _format_rupees(chain.get("atm")),
             "current_price": chain.get("current_price"),
+            "current_price_display": _format_rupees(chain.get("current_price")),
             "top_call_oi": _top_oi(calls),
             "top_put_oi": _top_oi(puts),
         }
@@ -4214,29 +4692,36 @@ class NubraService:
                     distance_pct = round(abs((float(strike) - float(current_price)) / float(current_price)) * 100.0, 4)
                     if distance_pct <= max_distance_pct:
                         strike_candidates.append(
-                            {
-                                "wall_type": side,
-                                "strike_price": strike,
-                                "open_interest": leg.get("oi"),
-                                "distance_pct": distance_pct,
-                                "last_traded_price": leg.get("ltp"),
-                                "iv": leg.get("iv"),
-                            }
+                            _with_display_fields(
+                                {
+                                    "wall_type": side,
+                                    "strike_price": strike,
+                                    "open_interest": leg.get("oi"),
+                                    "distance_pct": distance_pct,
+                                    "last_traded_price": leg.get("ltp"),
+                                    "iv": leg.get("iv"),
+                                },
+                                ["strike_price", "last_traded_price"],
+                            )
                         )
             strike_candidates.sort(key=lambda row: (row["distance_pct"], -(row.get("open_interest") or 0)))
             rows.append(
-                {
-                    "symbol": symbol.strip().upper(),
-                    "expiry": chain.get("expiry"),
-                    "current_price": current_price,
-                    "nearby_walls": strike_candidates[:top_k],
-                }
+                _with_display_fields(
+                    {
+                        "symbol": symbol.strip().upper(),
+                        "expiry": chain.get("expiry"),
+                        "current_price": current_price,
+                        "nearby_walls": strike_candidates[:top_k],
+                    },
+                    ["current_price"],
+                )
             )
         ranked = sorted(
             rows,
             key=lambda row: row["nearby_walls"][0]["distance_pct"] if row.get("nearby_walls") else float("inf"),
         )
         return {
+            "data_source": "nubra",
             "max_distance_pct": max_distance_pct,
             "top_k": top_k,
             "rows": ranked,
@@ -4267,12 +4752,13 @@ class NubraService:
         latest = enriched.iloc[-1].to_dict()
         latest["timestamp"] = str(latest.get("timestamp"))
         return {
+            "data_source": "nubra",
             "symbol": symbol.strip().upper(),
             "timeframe": timeframe,
             "start_date": start_date,
             "end_date": end_date,
             "indicators": indicator_map,
-            "latest": latest,
+            "latest": _with_display_fields(latest, ["open", "high", "low", "close"]),
         }
 
     def scan_indicator_threshold(
@@ -4323,15 +4809,19 @@ class NubraService:
                 continue
             if ops[normalized_operator](latest_numeric, float(value)):
                 matches.append(
-                    {
-                        "symbol": symbol.strip().upper(),
-                        "indicator": indicator.upper(),
-                        "column": col,
-                        "latest_value": round(latest_numeric, 4),
-                        "timestamp": str(enriched["timestamp"].iloc[-1]),
-                    }
+                    _with_display_fields(
+                        {
+                            "symbol": symbol.strip().upper(),
+                            "indicator": indicator.upper(),
+                            "column": col,
+                            "latest_value": round(latest_numeric, 4),
+                            "timestamp": str(enriched["timestamp"].iloc[-1]),
+                        },
+                        [],
+                    )
                 )
         return {
+            "data_source": "nubra",
             "indicator": indicator.upper(),
             "operator": normalized_operator,
             "value": value,
@@ -4421,9 +4911,10 @@ class NubraService:
                         "slow_params": slow_params or {},
                     }
                 )
-                matches.append(signal_row)
+                matches.append(_with_display_fields(signal_row, ["close"]))
 
         return {
+            "data_source": "nubra",
             "timeframe": timeframe,
             "lookback_bars": lookback_bars,
             "direction": normalized_direction,

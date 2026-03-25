@@ -190,6 +190,40 @@ def register(mcp: Any, service: NubraService) -> None:
         except Exception as exc:
             return _failure("find_volume_spikes", exc)
 
+    @mcp.tool()
+    def find_volume_breakouts(
+        symbols: list[str],
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        instrument_type: str = "STOCK",
+        breakout_lookback_bars: int = 20,
+        volume_lookback_bars: int = 20,
+        min_volume_spike_ratio: float = 1.5,
+        min_breakout_pct: float = 0.0,
+        require_close_breakout: bool = True,
+    ) -> dict[str, Any]:
+        """Find symbols confirming a volume breakout using Nubra historical data with price-breakout and volume-spike checks.""" 
+        try:
+            return _success(
+                "find_volume_breakouts",
+                service.find_volume_breakouts(
+                    symbols,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exchange=exchange,
+                    instrument_type=instrument_type,
+                    breakout_lookback_bars=breakout_lookback_bars,
+                    volume_lookback_bars=volume_lookback_bars,
+                    min_volume_spike_ratio=min_volume_spike_ratio,
+                    min_breakout_pct=min_breakout_pct,
+                    require_close_breakout=require_close_breakout,
+                ),
+            )
+        except Exception as exc:
+            return _failure("find_volume_breakouts", exc)
+
 
     @mcp.tool()
     def summarize_option_chain(

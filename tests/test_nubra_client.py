@@ -10,7 +10,15 @@ from pathlib import Path
 import pandas as pd
 
 from config import Settings
-from nubra_client import AuthState, HistoricalQuery, NubraAPIError, NubraClient, NubraService
+from nubra_client import (
+    AuthState,
+    HistoricalQuery,
+    NubraAPIError,
+    NubraClient,
+    NubraService,
+    OrderRequest,
+    normalize_nubra_payload,
+)
 
 
 class DummyHistoricalClient:
@@ -114,6 +122,44 @@ class DummyPortfolioClient:
 
 
 class NubraClientTests(unittest.TestCase):
+    def test_normalize_nubra_payload_converts_portfolio_money_fields_to_rupees(self) -> None:
+        payload = normalize_nubra_payload(
+            {
+                "funds": {
+                    "port_funds_and_margin": {
+                        "start_of_day_funds": 10000000,
+                        "net_margin_available": -500000,
+                        "total_margin_blocked": 1200000,
+                        "mtm_deriv": -10000,
+                        "mtm_eq_iday_cnc": 5000,
+                        "mtm_eq_delivery": -1000,
+                    }
+                },
+                "portfolio": {
+                    "holding_stats": {"invested_amount": 280000},
+                    "holdings": [
+                        {
+                            "symbol": "RELIANCE",
+                            "invested_value": 280000,
+                            "current_value": 300000,
+                            "net_pnl": 20000,
+                            "margin_benefit": 100000,
+                        }
+                    ],
+                },
+            }
+        )
+
+        funds = payload["funds"]["port_funds_and_margin"]
+        holding = payload["portfolio"]["holdings"][0]
+        self.assertEqual(funds["start_of_day_funds"], 100000.0)
+        self.assertEqual(funds["start_of_day_funds_display"], "Rs. 100,000.00")
+        self.assertEqual(funds["net_margin_available"], -5000.0)
+        self.assertEqual(holding["invested_value"], 2800.0)
+        self.assertEqual(holding["current_value"], 3000.0)
+        self.assertEqual(holding["net_pnl"], 200.0)
+        self.assertEqual(holding["margin_benefit_display"], "Rs. 1,000.00")
+
     def test_auth_state_path_resolves_relative_to_repo(self) -> None:
         settings = Settings(auth_state_file="tmp/auth_state.json")
         self.assertTrue(settings.auth_state_path.is_absolute())
@@ -169,6 +215,119 @@ class NubraClientTests(unittest.TestCase):
             self.assertTrue(second["session_active"])
             self.assertEqual(calls["count"], 1)
 
+    def test_set_environment_clears_existing_session_and_reports_saved_mpin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "auth_state.json"
+            state = AuthState(
+                environment="PROD",
+                phone="9999999999",
+                device_id="device-1",
+                auth_token="auth",
+                session_token="session",
+                authenticated=True,
+            )
+            state_path.write_text(json.dumps(asdict(state)), encoding="utf-8")
+            client = NubraClient(Settings(environment="PROD", auth_state_file=str(state_path), mpin="4321"))
+
+            client.logout = lambda: {"message": "Logged out.", "environment": "PROD"}  # type: ignore[method-assign]
+
+            payload = client.set_environment("UAT")
+
+            self.assertEqual(payload["environment"], "UAT")
+            self.assertEqual(payload["previous_environment"], "PROD")
+            self.assertTrue(payload["session_reset"])
+            self.assertTrue(payload["saved_mpin_available"])
+            self.assertEqual(payload["next_step"], "send_otp")
+
+    def test_verify_otp_with_saved_mpin_reuses_configured_mpin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(Path(temp_dir) / "auth.json"), mpin="9876"))
+
+            calls: dict[str, str] = {}
+
+            def fake_verify_otp(otp: str, phone: str | None = None) -> dict[str, object]:
+                calls["otp"] = otp
+                return {"environment": "UAT", "phone": phone or "9999999999"}
+
+            def fake_verify_mpin(mpin: str) -> dict[str, object]:
+                calls["mpin"] = mpin
+                return {"environment": "UAT", "phone": "9999999999", "authenticated": True}
+
+            client.verify_otp = fake_verify_otp  # type: ignore[method-assign]
+            client.verify_mpin = fake_verify_mpin  # type: ignore[method-assign]
+
+            payload = client.verify_otp_with_saved_mpin("123456", phone="9999999999")
+
+            self.assertEqual(calls["otp"], "123456")
+            self.assertEqual(calls["mpin"], "9876")
+            self.assertTrue(payload["authenticated"])
+            self.assertTrue(payload["used_saved_mpin"])
+
+    def test_connect_nubra_mcp_stores_session_mpin_and_sends_otp(self) -> None:
+        client = NubraClient(Settings(environment="PROD", auth_state_file="auth_state_test.json"))
+        client.switch_environment_and_send_otp = lambda environment, phone=None: {  # type: ignore[method-assign]
+            "environment": environment,
+            "phone": phone or "9999999999",
+            "device_id": "device-1",
+        }
+
+        payload = client.connect_nubra_mcp(phone="9999999999", mpin="2468", environment="PROD")
+
+        self.assertEqual(payload["intro_message"], "Connected successfully with nubra mcp.")
+        self.assertEqual(payload["next_step"], "complete_connect_with_otp")
+        self.assertEqual(client._session_mpin, "2468")
+
+    def test_complete_connect_with_otp_uses_session_mpin(self) -> None:
+        client = NubraClient(Settings(environment="PROD", auth_state_file="auth_state_test.json"))
+        client._session_mpin = "2468"
+
+        calls: dict[str, str] = {}
+
+        def fake_verify_otp(otp: str, phone: str | None = None) -> dict[str, object]:
+            calls["otp"] = otp
+            return {"environment": "PROD", "phone": phone or "9999999999"}
+
+        def fake_verify_mpin(mpin: str) -> dict[str, object]:
+            calls["mpin"] = mpin
+            return {"environment": "PROD", "phone": "9999999999", "authenticated": True}
+
+        client.verify_otp = fake_verify_otp  # type: ignore[method-assign]
+        client.verify_mpin = fake_verify_mpin  # type: ignore[method-assign]
+
+        payload = client.complete_connect_with_otp("123456", phone="9999999999")
+
+        self.assertEqual(calls["otp"], "123456")
+        self.assertEqual(calls["mpin"], "2468")
+        self.assertTrue(payload["authenticated"])
+        self.assertIsNone(client._session_mpin)
+
+    def test_client_place_order_uses_sdk_path_in_uat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(Path(temp_dir) / "auth.json")))
+
+            class FakeTrade:
+                def create_order(self, payload):
+                    return {"order_id": 777, "exchange": payload["exchange"], "ref_id": payload["ref_id"]}
+
+            client._get_sdk_clients = lambda environment=None: (None, FakeTrade(), None, {})  # type: ignore[method-assign]
+
+            payload = client.place_order(
+                OrderRequest(
+                    ref_id=71335,
+                    exchange="NSE",
+                    order_type="ORDER_TYPE_REGULAR",
+                    order_qty=1,
+                    order_side="ORDER_SIDE_BUY",
+                    order_delivery_type="ORDER_DELIVERY_TYPE_CNC",
+                    validity_type="DAY",
+                    price_type="LIMIT",
+                    order_price=1220,
+                )
+            )
+
+            self.assertEqual(payload["order_id"], 777)
+            self.assertEqual(payload["ref_id"], 71335)
+
 
 class HistoricalWindowTests(unittest.TestCase):
     def test_daily_history_defaults_to_recent_month(self) -> None:
@@ -204,6 +363,67 @@ class HistoricalWindowTests(unittest.TestCase):
         self.assertGreaterEqual((end_dt - start_dt).days, 1)
         self.assertLessEqual((end_dt - start_dt).days, 2)
         self.assertTrue(query["intraDay"])
+
+    def test_volume_breakout_finds_confirmed_match(self) -> None:
+        service = NubraService(DummyHistoricalClient())
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=25, freq="D"),
+                "open": [100.0] * 25,
+                "high": [101.0] * 24 + [110.0],
+                "low": [99.0] * 25,
+                "close": [100.5] * 24 + [109.0],
+                "volume": [1000.0] * 24 + [3000.0],
+            }
+        )
+        service._historical_to_df = lambda *args, **kwargs: df  # type: ignore[method-assign]
+
+        payload = service.find_volume_breakouts(
+            ["RELIANCE"],
+            timeframe="1d",
+            start_date="2026-01-01",
+            end_date="2026-01-25",
+            breakout_lookback_bars=20,
+            volume_lookback_bars=20,
+            min_volume_spike_ratio=1.5,
+            min_breakout_pct=0.0,
+            require_close_breakout=True,
+        )
+
+        self.assertEqual(payload["strategy"], "volume_breakout")
+        self.assertEqual(payload["summary"]["match_count"], 1)
+        self.assertEqual(payload["matches"][0]["symbol"], "RELIANCE")
+        self.assertEqual(payload["matches"][0]["latest_close_display"], "Rs. 109.00")
+
+    def test_volume_breakout_deduplicates_symbols_before_fetching(self) -> None:
+        service = NubraService(DummyHistoricalClient())
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=25, freq="D"),
+                "open": [100.0] * 25,
+                "high": [101.0] * 24 + [110.0],
+                "low": [99.0] * 25,
+                "close": [100.5] * 24 + [109.0],
+                "volume": [1000.0] * 24 + [3000.0],
+            }
+        )
+        calls: list[str] = []
+
+        def fake_history(symbol: str, **kwargs) -> pd.DataFrame:
+            calls.append(symbol)
+            return df
+
+        service._historical_to_df = fake_history  # type: ignore[method-assign]
+
+        payload = service.find_volume_breakouts(
+            ["RELIANCE", "reliance", "CIPLA", "CIPLA"],
+            timeframe="1d",
+            start_date="2026-01-01",
+            end_date="2026-01-25",
+        )
+
+        self.assertEqual(sorted(calls), ["CIPLA", "RELIANCE"])
+        self.assertEqual(payload["summary"]["match_count"], 2)
 
 
 class PortfolioAndResolverTests(unittest.TestCase):
@@ -318,6 +538,40 @@ class PortfolioAndResolverTests(unittest.TestCase):
         self.assertEqual(payload["file_kind"], "csv")
         self.assertEqual(payload["file_name"], Path(payload["csv_path"]).name)
         self.assertTrue(payload["download_ready"])
+
+    def test_current_price_by_symbol_includes_nubra_source_and_rupee_display(self) -> None:
+        class DummyPriceClient:
+            def resolve_symbol(self, symbol: str, exchange: str = "NSE"):
+                class Instrument:
+                    def model_dump(self_inner):
+                        return {"symbol": symbol, "exchange": exchange, "ref_id": 123}
+
+                return Instrument()
+
+            def get_current_price(self, symbol: str, exchange: str = "NSE") -> dict:
+                return {"exchange": exchange, "price": 1220.0, "prev_close": 1200.0, "change": 1.6667}
+
+        service = NubraService(DummyPriceClient())
+        payload = service.current_price_by_symbol("CIPLA")
+
+        self.assertEqual(payload["data_source"], "nubra")
+        self.assertEqual(payload["current_price_display"], "Rs. 1,220.00")
+        self.assertEqual(payload["previous_close_display"], "Rs. 1,200.00")
+
+    def test_auth_status_includes_intro_and_prod_market_data_guidance(self) -> None:
+        class DummyAuthClient:
+            def auth_status(self):
+                return {
+                    "intro_message": "Connected to nubra-mcp. Authentication, market data, analytics, and environment switching are available.",
+                    "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage. Use UAT for order placement testing.",
+                    "environment": "UAT",
+                }
+
+        service = NubraService(DummyAuthClient())
+        payload = service.auth_status()
+
+        self.assertIn("Connected to nubra-mcp", payload["intro_message"])
+        self.assertIn("Use PROD for market data", payload["market_data_environment_recommendation"])
 
 
 class UatOrderGuardTests(unittest.TestCase):
