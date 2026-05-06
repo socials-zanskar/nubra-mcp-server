@@ -47,6 +47,11 @@ def _load_known_env_files() -> None:
 
 _load_known_env_files()
 
+if os.getenv("PHONE", "").strip() and not os.getenv("PHONE_NO", "").strip():
+    os.environ["PHONE_NO"] = os.getenv("PHONE", "").strip()
+if os.getenv("PHONE_NO", "").strip() and not os.getenv("PHONE", "").strip():
+    os.environ["PHONE"] = os.getenv("PHONE_NO", "").strip()
+
 
 @dataclass(slots=True)
 class Settings:
@@ -62,8 +67,9 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        phone = os.getenv("PHONE", "").strip() or os.getenv("PHONE_NO", "").strip()
         return cls(
-            phone=os.getenv("PHONE", "").strip(),
+            phone=phone,
             mpin=os.getenv("MPIN", "").strip(),
             environment=os.getenv("NUBRA_ENV", "PROD").strip().upper(),
             default_exchange=os.getenv("NUBRA_DEFAULT_EXCHANGE", "NSE").strip().upper(),

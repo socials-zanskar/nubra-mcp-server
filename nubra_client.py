@@ -5,6 +5,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -314,8 +315,39 @@ def _with_display_fields(row: dict[str, Any], price_keys: list[str]) -> dict[str
     return output
 
 
-def _ns_epoch_to_ist(value: int | float) -> str:
-    dt = datetime.fromtimestamp(float(value) / 1_000_000_000, tz=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+def _historical_point_attr(point: Any, *names: str) -> Any:
+    if isinstance(point, dict):
+        for name in names:
+            if name in point:
+                return point.get(name)
+        return None
+    for name in names:
+        if hasattr(point, name):
+            return getattr(point, name)
+    return None
+
+
+def _historical_series_to_map(points: Any) -> dict[int, Any]:
+    if not points:
+        return {}
+    output: dict[int, Any] = {}
+    for point in points:
+        ts = _historical_point_attr(point, "timestamp", "ts", "t")
+        value = _historical_point_attr(point, "value", "v")
+        if ts is None:
+            continue
+        output[int(ts)] = value
+    return output
+
+
+def _ns_epoch_to_ist(value: int | float) -> str | None:
+    try:
+        seconds = float(value) / 1_000_000_000
+        dt = datetime.fromtimestamp(seconds, tz=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+    except (OSError, OverflowError, ValueError):
+        return None
+    if dt.year < 2000 or dt.year > 2100:
+        return None
     return dt.isoformat()
 
 
@@ -337,7 +369,9 @@ def add_ist_time_fields(payload: Any) -> Any:
             converted_value = add_ist_time_fields(item_value)
             output[item_key] = converted_value
             if item_key in TIME_KEYS and isinstance(item_value, (int, float)):
-                output[f"{item_key}_ist"] = _ns_epoch_to_ist(item_value)
+                ist_value = _ns_epoch_to_ist(item_value)
+                if ist_value:
+                    output[f"{item_key}_ist"] = ist_value
             if item_key in {"market_time"} and isinstance(item_value, str):
                 ist_value = _iso_utc_to_ist(item_value)
                 if ist_value:
@@ -469,10 +503,11 @@ class OrderRequest(BaseModel):
 
 class ModifyOrderRequest(BaseModel):
     order_id: int = Field(gt=0)
-    exchange: str = "NSE"
-    order_type: str = "ORDER_TYPE_REGULAR"
-    order_qty: int = Field(gt=0)
-    order_price: int = Field(gt=0)
+    exchange: str | None = None
+    order_type: str | None = None
+    order_qty: int | None = Field(default=None, gt=0)
+    price_type: str | None = None
+    order_price: int | None = Field(default=None, gt=0)
     algo_params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1126,6 +1161,7 @@ class NubraClient:
         return effective
 
     def _get_sdk_clients(self, environment: str | None = None) -> tuple[Any, Any, Any, dict[str, Any]]:
+        self._prime_sdk_environment()
         try:
             from nubra_python_sdk.marketdata.market_data import MarketData
             from nubra_python_sdk.refdata.instruments import InstrumentData
@@ -1141,6 +1177,17 @@ class NubraClient:
         instruments = InstrumentData(nubra)
         trade = NubraTrader(nubra, version="V2")
         market_data = MarketData(nubra)
+        for sdk_client in (instruments, trade, market_data):
+            for attr_name in (
+                "_InitNubraSdk__phone_number",
+                "_InitNubraSdk__mpin",
+                "token_data",
+                "db_path",
+                "env_path_login",
+                "totp_login",
+            ):
+                if hasattr(nubra, attr_name):
+                    setattr(sdk_client, attr_name, getattr(nubra, attr_name))
         enums = {
             "OrderSideEnum": OrderSideEnum,
             "DeliveryTypeEnum": DeliveryTypeEnum,
@@ -1148,6 +1195,17 @@ class NubraClient:
             "ExchangeEnum": ExchangeEnum,
         }
         return instruments, trade, market_data, enums
+
+    def _prime_sdk_environment(self) -> None:
+        """Mirror MCP config into the environment names expected by nubra-python-sdk."""
+        if self.settings.phone:
+            os.environ["PHONE"] = self.settings.phone
+            os.environ.setdefault("PHONE_NO", self.settings.phone)
+        sdk_phone = os.getenv("PHONE_NO", "").strip()
+        if sdk_phone and not os.getenv("PHONE", "").strip():
+            os.environ["PHONE"] = sdk_phone
+        if self.settings.mpin:
+            os.environ["MPIN"] = self.settings.mpin
 
     def _sdk_to_plain(self, value: Any) -> Any:
         if hasattr(value, "model_dump"):
@@ -1161,8 +1219,7 @@ class NubraClient:
         return value
 
     def place_order(self, order: OrderRequest) -> dict[str, Any]:
-        effective_environment = self._require_uat_trading()
-        _, trade, _, _ = self._get_sdk_clients(effective_environment)
+        self._require_uat_trading()
         payload = {
             "ref_id": int(order.ref_id or 0),
             "order_type": order.order_type,
@@ -1178,23 +1235,39 @@ class NubraClient:
         if order.order_price is not None:
             payload["order_price"] = int(round(float(order.order_price)))
         try:
-            response = trade.create_order(payload)
+            response = self._request(
+                "POST",
+                "orders/v2/single",
+                json_body=payload,
+                headers=self._headers(use_session_token=True),
+            )
         except Exception as exc:
             raise NubraAPIError(f"UAT order placement failed: {exc}") from exc
-        return self._sdk_to_plain(response)
+        return normalize_nubra_payload(response)
 
     def cancel_order(self, order_id: int) -> dict[str, Any]:
-        effective_environment = self._require_uat_trading()
-        _, trade, _, _ = self._get_sdk_clients(effective_environment)
+        self._require_uat_trading()
+        payload = {
+            "baskets": None,
+            "orders": [{"order_id": int(order_id)}],
+        }
         try:
-            response = trade.cancel_orders_v2(order_ids=[int(order_id)])
+            response = self._request(
+                "POST",
+                "orders/v2/cancelV2",
+                json_body=payload,
+                headers=self._headers(use_session_token=True),
+            )
         except Exception as exc:
             raise NubraAPIError(f"UAT order cancellation failed: {exc}") from exc
-        return self._sdk_to_plain(response)
+        return normalize_nubra_payload(response)
 
     def modify_order(self, request: ModifyOrderRequest) -> dict[str, Any]:
-        effective_environment = self._require_uat_trading()
-        _, trade, _, _ = self._get_sdk_clients(effective_environment)
+        self._require_uat_trading()
+        if not request.exchange or not request.order_type or request.order_qty is None or request.order_price is None:
+            raise NubraAPIError(
+                "Modify order requires exchange, order_type, order_qty, and order_price after resolution."
+            )
         payload = {
             "exchange": request.exchange,
             "order_type": request.order_type,
@@ -1202,11 +1275,18 @@ class NubraClient:
             "order_price": int(round(float(request.order_price))),
             "algo_params": request.algo_params or None,
         }
+        if request.price_type:
+            payload["price_type"] = request.price_type
         try:
-            response = trade.modify_order_v2(int(request.order_id), payload)
+            response = self._request(
+                "POST",
+                f"orders/v2/modify/{int(request.order_id)}",
+                json_body=payload,
+                headers=self._headers(use_session_token=True),
+            )
         except Exception as exc:
             raise NubraAPIError(f"UAT order modification failed: {exc}") from exc
-        return self._sdk_to_plain(response)
+        return normalize_nubra_payload(response)
 
     def get_orders(
         self,
@@ -2767,9 +2847,80 @@ class NubraService:
             "cancel_result": response,
         }
 
+    def _find_order_for_modify(self, order_id: int) -> dict[str, Any]:
+        last_error: Exception | None = None
+        fetch_attempts = (
+            {"live": True},
+            {"executed": True},
+            {},
+        )
+
+        for fetch_kwargs in fetch_attempts:
+            try:
+                orders = self.client.get_orders(**fetch_kwargs)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            for order in orders:
+                if _to_int(order.get("order_id"), default=-1) == int(order_id):
+                    return order
+
+        if last_error is not None:
+            raise NubraAPIError(
+                f"Unable to fetch order details for order_id {order_id}: {last_error}"
+            ) from last_error
+        raise NubraAPIError(f"Order {order_id} was not found in the current UAT order book.")
+
+    def _resolve_modify_request(self, request_input: dict[str, Any]) -> ModifyOrderRequest:
+        request = ModifyOrderRequest(**request_input)
+        needs_backfill = any(
+            value in (None, "")
+            for value in (
+                request.exchange,
+                request.order_type,
+                request.order_qty,
+                request.order_price,
+            )
+        )
+        current_order: dict[str, Any] = {}
+        if needs_backfill:
+            current_order = self._find_order_for_modify(request.order_id)
+
+        if not request.exchange:
+            request.exchange = str(current_order.get("exchange") or "NSE").strip().upper()
+        if not request.order_type:
+            request.order_type = str(current_order.get("order_type") or "ORDER_TYPE_REGULAR").strip().upper()
+        if request.order_qty is None:
+            request.order_qty = _to_int(current_order.get("order_qty"), default=0) or None
+        if not request.price_type:
+            request.price_type = str(current_order.get("price_type") or "LIMIT").strip().upper()
+        if request.order_price is None:
+            current_price = current_order.get("order_price")
+            if current_price not in (None, ""):
+                request.order_price = int(round(float(current_price)))
+
+        missing_fields = [
+            name
+            for name, value in (
+                ("exchange", request.exchange),
+                ("order_type", request.order_type),
+                ("order_qty", request.order_qty),
+                ("order_price", request.order_price),
+            )
+            if value in (None, "")
+        ]
+        if missing_fields:
+            joined = ", ".join(missing_fields)
+            raise NubraAPIError(
+                f"Unable to resolve modify request for order {request.order_id}. Missing fields: {joined}."
+            )
+
+        return request
+
     def modify_order(self, request_input: dict[str, Any]) -> dict[str, Any]:
         effective_environment = self._require_uat_trading()
-        request = ModifyOrderRequest(**request_input)
+        request = self._resolve_modify_request(request_input)
         response = self.client.modify_order(request)
         return {
             "environment": effective_environment,
@@ -4076,7 +4227,6 @@ class NubraService:
         exchange: str = "NSE",
         instrument_type: str = "STOCK",
     ) -> Any:
-        to_ohlcv_df, _ = self._load_talib_helpers()
         payload = self.historical_data(
             symbol,
             timeframe=timeframe,
@@ -4086,7 +4236,42 @@ class NubraService:
             instrument_type=instrument_type,
             fields=["open", "high", "low", "close", "cumulative_volume"],
         )
-        df = to_ohlcv_df(payload, symbol=symbol.strip().upper(), interval=timeframe)
+        normalized_symbol = symbol.strip().upper()
+        rows: list[dict[str, Any]] = []
+        for result in payload.get("result") or []:
+            values = result.get("values") or []
+            for stock_data in values:
+                if not isinstance(stock_data, dict):
+                    continue
+                stock_chart = stock_data.get(normalized_symbol)
+                if not stock_chart:
+                    continue
+                open_s = _historical_series_to_map(stock_chart.get("open"))
+                high_s = _historical_series_to_map(stock_chart.get("high"))
+                low_s = _historical_series_to_map(stock_chart.get("low"))
+                close_s = _historical_series_to_map(stock_chart.get("close"))
+                vol_s = _historical_series_to_map(stock_chart.get("cumulative_volume"))
+                all_ts = set(open_s) | set(high_s) | set(low_s) | set(close_s) | set(vol_s)
+                for ts in sorted(all_ts):
+                    rows.append(
+                        {
+                            "timestamp": ts,
+                            "open": open_s.get(ts),
+                            "high": high_s.get(ts),
+                            "low": low_s.get(ts),
+                            "close": close_s.get(ts),
+                            "volume": vol_s.get(ts),
+                        }
+                    )
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns", utc=True, errors="coerce")
+            df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
+            for column in ("open", "high", "low", "close", "volume"):
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            if timeframe.strip().lower() != "1d":
+                df["volume"] = df["volume"].diff()
         if df is None or getattr(df, "empty", True):
             raise NubraAPIError(
                 f"No historical OHLCV data returned for '{symbol}'.",

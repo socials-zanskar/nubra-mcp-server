@@ -25,6 +25,7 @@ Useful local helpers:
 
 import argparse
 import logging
+import sys
 from typing import Any
 
 import uvicorn
@@ -36,6 +37,17 @@ from nubra_client import NubraClient, NubraService
 from tools import account, analytics, auth, backtest, journal, options, orders, portfolio, quotes, risk, screener, talib_tools
 
 logger = logging.getLogger(__name__)
+
+
+def configure_stdio_utf8() -> None:
+    """Avoid Windows console encoding crashes from SDK output during login flows."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,6 +103,7 @@ def create_app(settings: Settings, mcp: FastMCP) -> FastAPI:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    configure_stdio_utf8()
     settings = Settings.from_env()
 
     if args.host:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -13,6 +14,7 @@ from config import Settings
 from nubra_client import (
     AuthState,
     HistoricalQuery,
+    ModifyOrderRequest,
     NubraAPIError,
     NubraClient,
     NubraService,
@@ -165,6 +167,24 @@ class NubraClientTests(unittest.TestCase):
         self.assertTrue(settings.auth_state_path.is_absolute())
         self.assertTrue(str(settings.auth_state_path).endswith("tmp\\auth_state.json"))
 
+    def test_settings_from_env_accepts_phone_no_alias(self) -> None:
+        previous_phone = os.environ.get("PHONE")
+        previous_phone_no = os.environ.get("PHONE_NO")
+        try:
+            os.environ.pop("PHONE", None)
+            os.environ["PHONE_NO"] = "9999999999"
+            settings = Settings.from_env()
+            self.assertEqual(settings.phone, "9999999999")
+        finally:
+            if previous_phone is None:
+                os.environ.pop("PHONE", None)
+            else:
+                os.environ["PHONE"] = previous_phone
+            if previous_phone_no is None:
+                os.environ.pop("PHONE_NO", None)
+            else:
+                os.environ["PHONE_NO"] = previous_phone_no
+
     def test_load_state_resets_environment_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "auth_state.json"
@@ -301,15 +321,21 @@ class NubraClientTests(unittest.TestCase):
         self.assertTrue(payload["authenticated"])
         self.assertIsNone(client._session_mpin)
 
-    def test_client_place_order_uses_sdk_path_in_uat(self) -> None:
+    def test_client_place_order_uses_current_session_rest_path_in_uat(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = NubraClient(Settings(environment="UAT", auth_state_file=str(Path(temp_dir) / "auth.json")))
+            client.state.session_token = "session-token"
+            client.state.authenticated = True
+            captured: dict[str, Any] = {}
 
-            class FakeTrade:
-                def create_order(self, payload):
-                    return {"order_id": 777, "exchange": payload["exchange"], "ref_id": payload["ref_id"]}
+            def fake_request(method, path, *, params=None, json_body=None, headers=None):
+                captured["method"] = method
+                captured["path"] = path
+                captured["json_body"] = json_body
+                captured["headers"] = headers
+                return {"order_id": 777, "exchange": json_body["exchange"], "ref_id": json_body["ref_id"]}
 
-            client._get_sdk_clients = lambda environment=None: (None, FakeTrade(), None, {})  # type: ignore[method-assign]
+            client._request = fake_request  # type: ignore[method-assign]
 
             payload = client.place_order(
                 OrderRequest(
@@ -325,8 +351,82 @@ class NubraClientTests(unittest.TestCase):
                 )
             )
 
+            self.assertEqual(captured["method"], "POST")
+            self.assertEqual(captured["path"], "orders/v2/single")
+            self.assertEqual(captured["json_body"]["ref_id"], 71335)
+            self.assertEqual(captured["headers"]["Authorization"], "Bearer session-token")
             self.assertEqual(payload["order_id"], 777)
             self.assertEqual(payload["ref_id"], 71335)
+
+    def test_client_modify_order_includes_price_type_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(Path(temp_dir) / "auth.json")))
+            client.state.session_token = "session-token"
+            client.state.authenticated = True
+            captured: dict[str, Any] = {}
+
+            def fake_request(method, path, *, params=None, json_body=None, headers=None):
+                captured["method"] = method
+                captured["path"] = path
+                captured["json_body"] = json_body
+                captured["headers"] = headers
+                return {"message": "update request pushed"}
+
+            client._request = fake_request  # type: ignore[method-assign]
+
+            payload = client.modify_order(
+                ModifyOrderRequest(
+                    order_id=12345,
+                    exchange="NSE",
+                    order_type="ORDER_TYPE_REGULAR",
+                    order_qty=10,
+                    price_type="LIMIT",
+                    order_price=1030,
+                )
+            )
+
+            self.assertEqual(captured["method"], "POST")
+            self.assertEqual(captured["path"], "orders/v2/modify/12345")
+            self.assertEqual(captured["json_body"]["order_qty"], 10)
+            self.assertEqual(captured["json_body"]["order_price"], 1030)
+            self.assertEqual(captured["json_body"]["price_type"], "LIMIT")
+            self.assertEqual(captured["headers"]["Authorization"], "Bearer session-token")
+            self.assertEqual(payload["message"], "update request pushed")
+
+    def test_prime_sdk_environment_sets_phone_no_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = NubraClient(
+                Settings(
+                    environment="UAT",
+                    auth_state_file=str(Path(temp_dir) / "auth.json"),
+                    phone="9999999999",
+                    mpin="2468",
+                )
+            )
+            previous_phone = os.environ.get("PHONE")
+            previous_phone_no = os.environ.get("PHONE_NO")
+            previous_mpin = os.environ.get("MPIN")
+            try:
+                os.environ.pop("PHONE", None)
+                os.environ.pop("PHONE_NO", None)
+                os.environ.pop("MPIN", None)
+                client._prime_sdk_environment()
+                self.assertEqual(os.environ["PHONE"], "9999999999")
+                self.assertEqual(os.environ["PHONE_NO"], "9999999999")
+                self.assertEqual(os.environ["MPIN"], "2468")
+            finally:
+                if previous_phone is None:
+                    os.environ.pop("PHONE", None)
+                else:
+                    os.environ["PHONE"] = previous_phone
+                if previous_phone_no is None:
+                    os.environ.pop("PHONE_NO", None)
+                else:
+                    os.environ["PHONE_NO"] = previous_phone_no
+                if previous_mpin is None:
+                    os.environ.pop("MPIN", None)
+                else:
+                    os.environ["MPIN"] = previous_mpin
 
 
 class HistoricalWindowTests(unittest.TestCase):
@@ -702,6 +802,37 @@ class UatOrderGuardTests(unittest.TestCase):
                     "order_price": 1400,
                 }
             )
+            self.assertEqual(payload["environment"], "UAT")
+            self.assertEqual(payload["modify_result"]["order_id"], 12345)
+
+    def test_modify_order_backfills_missing_fields_from_live_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(Path(temp_dir) / "auth.json")))
+            service = NubraService(client)
+
+            client.get_orders = lambda **kwargs: [  # type: ignore[method-assign]
+                {
+                    "order_id": 12345,
+                    "exchange": "NSE",
+                    "order_type": "ORDER_TYPE_REGULAR",
+                    "order_qty": 10,
+                    "price_type": "LIMIT",
+                    "order_price": 1000,
+                }
+            ]
+
+            def fake_modify_order(request):
+                self.assertEqual(request.exchange, "NSE")
+                self.assertEqual(request.order_type, "ORDER_TYPE_REGULAR")
+                self.assertEqual(request.order_qty, 10)
+                self.assertEqual(request.price_type, "LIMIT")
+                self.assertEqual(request.order_price, 1030)
+                return {"status": "modified", "order_id": request.order_id}
+
+            client.modify_order = fake_modify_order  # type: ignore[method-assign]
+
+            payload = service.modify_order({"order_id": 12345, "order_price": 1030})
+
             self.assertEqual(payload["environment"], "UAT")
             self.assertEqual(payload["modify_result"]["order_id"], 12345)
 
