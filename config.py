@@ -64,6 +64,8 @@ class Settings:
     port: int = 8000
     mcp_path: str = "/mcp"
     auth_state_file: str = "auth_state.json"
+    collector_root: str = ""
+    collector_python: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,6 +80,8 @@ class Settings:
             port=int(os.getenv("PORT", "8000")),
             mcp_path=os.getenv("MCP_PATH", "/mcp").strip(),
             auth_state_file=os.getenv("AUTH_STATE_FILE", "auth_state.json").strip(),
+            collector_root=os.getenv("NUBRA_COLLECTOR_ROOT", "").strip(),
+            collector_python=os.getenv("NUBRA_COLLECTOR_PYTHON", "").strip(),
         )
 
     @property
@@ -86,6 +90,20 @@ class Settings:
         if raw_path.is_absolute():
             return raw_path
         return _detect_config_root() / raw_path
+
+    @property
+    def collector_root_path(self) -> Path:
+        if self.collector_root:
+            raw_path = Path(self.collector_root).expanduser()
+            return raw_path if raw_path.is_absolute() else (REPO_ROOT / raw_path).resolve()
+        return (REPO_ROOT.parent / "nubracollector").resolve()
+
+    @property
+    def collector_python_path(self) -> Path | None:
+        if not self.collector_python:
+            return None
+        raw_path = Path(self.collector_python).expanduser()
+        return raw_path if raw_path.is_absolute() else (REPO_ROOT / raw_path).resolve()
 
 
 def ensure_user_env_file(force: bool = False) -> Path:

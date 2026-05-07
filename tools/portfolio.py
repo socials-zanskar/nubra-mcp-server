@@ -69,6 +69,77 @@ def register(mcp: Any, service: NubraService) -> None:
             return _failure("get_account_health_report", exc)
 
     @mcp.tool()
+    def get_portfolio_sector_exposure(
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        """Group current portfolio exposure by the closest available sector-like classification from Nubra portfolio data."""
+        try:
+            return _success(
+                "get_portfolio_sector_exposure",
+                service.get_portfolio_sector_exposure(
+                    include_holdings=include_holdings,
+                    include_positions=include_positions,
+                ),
+            )
+        except Exception as exc:
+            return _failure("get_portfolio_sector_exposure", exc)
+
+    @mcp.tool()
+    def get_portfolio_concentration_risk(top_n: int = 5) -> dict[str, Any]:
+        """Measure single-name concentration and HHI concentration risk across the current portfolio snapshot."""
+        try:
+            return _success("get_portfolio_concentration_risk", service.get_portfolio_concentration_risk(top_n=top_n))
+        except Exception as exc:
+            return _failure("get_portfolio_concentration_risk", exc)
+
+    @mcp.tool()
+    def get_portfolio_rolling_drawdown(
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        """Build a historical drawdown series for the current portfolio using current quantities applied across Nubra historical closes."""
+        try:
+            return _success(
+                "get_portfolio_rolling_drawdown",
+                service.get_portfolio_rolling_drawdown(
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    include_holdings=include_holdings,
+                    include_positions=include_positions,
+                ),
+            )
+        except Exception as exc:
+            return _failure("get_portfolio_rolling_drawdown", exc)
+
+    @mcp.tool()
+    def get_portfolio_correlation_matrix(
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        """Compute a return-correlation matrix for current portfolio constituents using Nubra historical closes."""
+        try:
+            return _success(
+                "get_portfolio_correlation_matrix",
+                service.get_portfolio_correlation_matrix(
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    include_holdings=include_holdings,
+                    include_positions=include_positions,
+                ),
+            )
+        except Exception as exc:
+            return _failure("get_portfolio_correlation_matrix", exc)
+
+    @mcp.tool()
     def generate_portfolio_report() -> dict[str, Any]:
         """Generate a structured portfolio analysis report. No input arguments are required; the tool uses the authenticated account snapshot."""
         try:

@@ -7,6 +7,7 @@ import unittest
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -185,6 +186,10 @@ class NubraClientTests(unittest.TestCase):
             else:
                 os.environ["PHONE_NO"] = previous_phone_no
 
+    def test_settings_default_collector_root_points_to_sibling_repo(self) -> None:
+        settings = Settings()
+        self.assertTrue(str(settings.collector_root_path).endswith("Nubra_API_Full_context\\nubracollector"))
+
     def test_load_state_resets_environment_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "auth_state.json"
@@ -234,6 +239,115 @@ class NubraClientTests(unittest.TestCase):
             self.assertTrue(first["session_active"])
             self.assertTrue(second["session_active"])
             self.assertEqual(calls["count"], 1)
+
+    def test_open_nubracollector_ui_reuses_active_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "auth_state.json"
+            state = AuthState(
+                environment="PROD",
+                phone="9999999999",
+                device_id="device-1",
+                auth_token="auth-token",
+                session_token="session-token",
+                authenticated=True,
+            )
+            state_path.write_text(json.dumps(asdict(state)), encoding="utf-8")
+            client = NubraClient(Settings(environment="PROD", auth_state_file=str(state_path)))
+
+            seeded: dict[str, str] = {}
+
+            class DummyAdapter:
+                AUTO_CONNECT_ENV_VAR = "NUBRA_COLLECTOR_AUTO_CONNECT"
+                AUTO_CONNECT_ENV_NAME = "NUBRA_COLLECTOR_AUTO_ENV"
+                AUTO_CONNECT_PHONE_ENV_NAME = "NUBRA_COLLECTOR_AUTO_PHONE"
+
+                @staticmethod
+                def seed_shared_session(*, auth_token: str, session_token: str, device_id: str) -> str:
+                    seeded["auth_token"] = auth_token
+                    seeded["session_token"] = session_token
+                    seeded["device_id"] = device_id
+                    return "C:\\temp\\collector.db"
+
+            popen_kwargs: dict[str, object] = {}
+
+            class DummyPopen:
+                def __init__(self, args: list[str], **kwargs: object) -> None:
+                    popen_kwargs["args"] = args
+                    popen_kwargs.update(kwargs)
+                    self.pid = 4321
+
+            with (
+                patch.object(client, "_has_reusable_local_session", return_value=True),
+                patch.object(client, "_load_collector_session_adapter", return_value=DummyAdapter),
+                patch.object(client, "_resolve_collector_python", return_value="pythonw.exe"),
+                patch("nubra_client.subprocess.Popen", DummyPopen),
+            ):
+                payload = client.open_nubracollector_ui()
+
+            self.assertTrue(payload["session_reused"])
+            self.assertEqual(payload["pid"], 4321)
+            self.assertEqual(seeded["auth_token"], "auth-token")
+            self.assertEqual(seeded["session_token"], "session-token")
+            self.assertEqual(seeded["device_id"], "device-1")
+            self.assertEqual(popen_kwargs["args"], ["pythonw.exe", "-m", "nubracollector"])
+
+    def test_open_nubracollector_ui_falls_back_to_login_when_session_is_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "auth_state.json"
+            state_path.write_text(json.dumps(asdict(AuthState(environment="UAT", phone="9999999999"))), encoding="utf-8")
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(state_path)))
+
+            class DummyAdapter:
+                AUTO_CONNECT_ENV_VAR = "NUBRA_COLLECTOR_AUTO_CONNECT"
+                AUTO_CONNECT_ENV_NAME = "NUBRA_COLLECTOR_AUTO_ENV"
+                AUTO_CONNECT_PHONE_ENV_NAME = "NUBRA_COLLECTOR_AUTO_PHONE"
+
+                @staticmethod
+                def seed_shared_session(**_: object) -> str:
+                    raise AssertionError("seed_shared_session should not be called without an active session")
+
+            class DummyPopen:
+                def __init__(self, *_: object, **__: object) -> None:
+                    self.pid = 9876
+
+            with (
+                patch.object(client, "_has_reusable_local_session", return_value=False),
+                patch.object(client, "_load_collector_session_adapter", return_value=DummyAdapter),
+                patch.object(client, "_resolve_collector_python", return_value="python.exe"),
+                patch("nubra_client.subprocess.Popen", DummyPopen),
+            ):
+                payload = client.open_nubracollector_ui()
+
+            self.assertFalse(payload["session_reused"])
+            self.assertTrue(payload["requires_login"])
+
+    def test_open_backtest_ui_launches_in_prod_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "auth_state.json"
+            state_path.write_text(json.dumps(asdict(AuthState(environment="UAT", phone="9999999999"))), encoding="utf-8")
+            client = NubraClient(Settings(environment="UAT", auth_state_file=str(state_path)))
+
+            popen_kwargs: dict[str, object] = {}
+
+            class DummyPopen:
+                def __init__(self, args: list[str], **kwargs: object) -> None:
+                    popen_kwargs["args"] = args
+                    popen_kwargs.update(kwargs)
+                    self.pid = 2468
+
+            with patch("nubra_client.subprocess.Popen", DummyPopen):
+                payload = client.open_backtest_ui()
+
+            self.assertEqual(payload["environment"], "PROD")
+            self.assertEqual(payload["pid"], 2468)
+            self.assertIn("PROD mode", payload["message"])
+            self.assertEqual((popen_kwargs["env"] or {}).get("NUBRA_BACKTEST_UI_ENV"), "PROD")
+
+    def test_detached_popen_kwargs_use_start_new_session_on_posix(self) -> None:
+        client = NubraClient(Settings())
+        with patch("nubra_client.sys.platform", "darwin"):
+            payload = client._build_detached_popen_kwargs()
+        self.assertEqual(payload, {"start_new_session": True})
 
     def test_set_environment_clears_existing_session_and_reports_saved_mpin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -462,6 +576,20 @@ class HistoricalWindowTests(unittest.TestCase):
         end_dt = datetime.fromisoformat(query["endDate"].replace("Z", "+00:00"))
         self.assertGreaterEqual((end_dt - start_dt).days, 1)
         self.assertLessEqual((end_dt - start_dt).days, 2)
+        self.assertFalse(query["intraDay"])
+
+    def test_historical_data_respects_explicit_intraday_override(self) -> None:
+        service = NubraService(DummyHistoricalClient())
+        payload = service.historical_data(
+            "RELIANCE",
+            timeframe="1h",
+            start_date="2026-02-01T00:00:00.000Z",
+            end_date="2026-05-05T23:59:59.000Z",
+            instrument_type="STOCK",
+            intraday=True,
+        )
+
+        query = payload["query"]
         self.assertTrue(query["intraDay"])
 
     def test_volume_breakout_finds_confirmed_match(self) -> None:
@@ -524,6 +652,104 @@ class HistoricalWindowTests(unittest.TestCase):
 
         self.assertEqual(sorted(calls), ["CIPLA", "RELIANCE"])
         self.assertEqual(payload["summary"]["match_count"], 2)
+
+    def test_historical_to_df_normalizes_intraday_volume_by_session(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+
+        def point(ts_text: str, value: int) -> dict[str, int]:
+            ts = int(pd.Timestamp(ts_text, tz="Asia/Kolkata").tz_convert("UTC").value)
+            return {"ts": ts, "v": value}
+
+        payload = {
+            "result": [
+                {
+                    "values": [
+                        {
+                            "RELIANCE": {
+                                "open": [
+                                    point("2026-05-05 09:15", 10000),
+                                    point("2026-05-05 09:16", 10100),
+                                    point("2026-05-06 09:15", 10200),
+                                    point("2026-05-06 09:16", 10300),
+                                ],
+                                "high": [
+                                    point("2026-05-05 09:15", 10100),
+                                    point("2026-05-05 09:16", 10200),
+                                    point("2026-05-06 09:15", 10300),
+                                    point("2026-05-06 09:16", 10400),
+                                ],
+                                "low": [
+                                    point("2026-05-05 09:15", 9900),
+                                    point("2026-05-05 09:16", 10000),
+                                    point("2026-05-06 09:15", 10100),
+                                    point("2026-05-06 09:16", 10200),
+                                ],
+                                "close": [
+                                    point("2026-05-05 09:15", 10050),
+                                    point("2026-05-05 09:16", 10150),
+                                    point("2026-05-06 09:15", 10250),
+                                    point("2026-05-06 09:16", 10350),
+                                ],
+                                "cumulative_volume": [
+                                    point("2026-05-05 09:15", 100),
+                                    point("2026-05-05 09:16", 300),
+                                    point("2026-05-06 09:15", 50),
+                                    point("2026-05-06 09:16", 120),
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+        df = service._historical_payload_to_df(payload, symbol="RELIANCE", timeframe="1m")
+
+        self.assertEqual(df["volume"].tolist(), [100.0, 200.0, 50.0, 70.0])
+
+    def test_historical_to_df_fetches_extra_warmup_history(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        captured: dict[str, str] = {}
+
+        def point(ts_text: str, value: int) -> dict[str, int]:
+            ts = int(pd.Timestamp(ts_text, tz="Asia/Kolkata").tz_convert("UTC").value)
+            return {"ts": ts, "v": value}
+
+        payload = {
+            "result": [
+                {
+                    "values": [
+                        {
+                            "RELIANCE": {
+                                "open": [point("2026-04-01 09:15", 10000)],
+                                "high": [point("2026-04-01 09:15", 10100)],
+                                "low": [point("2026-04-01 09:15", 9900)],
+                                "close": [point("2026-04-01 09:15", 10050)],
+                                "cumulative_volume": [point("2026-04-01 09:15", 100)],
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+        def fake_historical_data(symbol, *, timeframe, start_date, end_date, exchange, instrument_type, fields):
+            captured["start_date"] = start_date
+            captured["end_date"] = end_date
+            return payload
+
+        service.historical_data = fake_historical_data  # type: ignore[method-assign]
+
+        service._historical_to_df(
+            "RELIANCE",
+            timeframe="1d",
+            start_date="2026-05-01",
+            end_date="2026-05-06",
+            instrument_type="STOCK",
+            warmup_bars=20,
+        )
+
+        self.assertLess(pd.Timestamp(captured["start_date"]), pd.Timestamp("2026-05-01T00:00:00Z"))
 
 
 class PortfolioAndResolverTests(unittest.TestCase):
@@ -672,6 +898,74 @@ class PortfolioAndResolverTests(unittest.TestCase):
 
         self.assertIn("Connected to nubra-mcp", payload["intro_message"])
         self.assertIn("Use PROD for market data", payload["market_data_environment_recommendation"])
+
+    def test_get_portfolio_sector_exposure_uses_asset_type_fallback(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        payload = service.get_portfolio_sector_exposure()
+
+        self.assertTrue(payload["fallback_used"])
+        self.assertTrue(payload["rows"])
+        self.assertIn("asset_type_fallback", payload["rows"][0]["classification_sources"])
+
+    def test_get_portfolio_concentration_risk_reports_hhi(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        payload = service.get_portfolio_concentration_risk(top_n=3)
+
+        self.assertIn("hhi", payload)
+        self.assertIn("top_exposures", payload)
+        self.assertGreaterEqual(payload["largest_single_name_pct"], 0.0)
+
+    def test_get_portfolio_rolling_drawdown_builds_preview(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        service._portfolio_instruments = lambda **kwargs: [  # type: ignore[method-assign]
+            {"symbol": "RELIANCE", "instrument_type": "STOCK", "signed_quantity": 2.0, "market_value": 3000.0},
+            {"symbol": "TCS", "instrument_type": "STOCK", "signed_quantity": 1.0, "market_value": 4000.0},
+        ]
+
+        def make_df(closes):
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.date_range("2026-01-01", periods=len(closes), freq="D"),
+                    "close": closes,
+                }
+            )
+
+        service._fetch_histories_for_symbols = lambda symbols, **kwargs: (  # type: ignore[method-assign]
+            {"RELIANCE": make_df([100, 110, 90, 95]), "TCS": make_df([200, 210, 220, 205])},
+            [],
+        )
+
+        payload = service.get_portfolio_rolling_drawdown(timeframe="1d")
+
+        self.assertIn("max_drawdown_pct", payload)
+        self.assertTrue(payload["preview_rows"])
+        self.assertEqual(payload["component_count"], 2)
+
+    def test_get_portfolio_correlation_matrix_returns_pairs(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        service._portfolio_instruments = lambda **kwargs: [  # type: ignore[method-assign]
+            {"symbol": "RELIANCE", "instrument_type": "STOCK", "signed_quantity": 2.0, "market_value": 3000.0},
+            {"symbol": "TCS", "instrument_type": "STOCK", "signed_quantity": 1.0, "market_value": 4000.0},
+        ]
+
+        def make_df(closes):
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.date_range("2026-01-01", periods=len(closes), freq="D"),
+                    "close": closes,
+                }
+            )
+
+        service._fetch_histories_for_symbols = lambda symbols, **kwargs: (  # type: ignore[method-assign]
+            {"RELIANCE": make_df([100, 102, 101, 103]), "TCS": make_df([200, 204, 202, 206])},
+            [],
+        )
+
+        payload = service.get_portfolio_correlation_matrix(timeframe="1d")
+
+        self.assertEqual(payload["component_count"], 2)
+        self.assertTrue(payload["matrix"])
+        self.assertTrue(payload["top_pairs"])
 
 
 class UatOrderGuardTests(unittest.TestCase):
@@ -837,6 +1131,91 @@ class UatOrderGuardTests(unittest.TestCase):
             self.assertEqual(payload["modify_result"]["order_id"], 12345)
 
 
+class ScreenerExtensionsTests(unittest.TestCase):
+    def test_find_gap_up_candidates_matches(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=3, freq="D"),
+                "open": [100.0, 101.0, 110.0],
+                "high": [102.0, 103.0, 112.0],
+                "low": [99.0, 100.0, 108.0],
+                "close": [101.0, 102.0, 111.0],
+                "volume": [1000.0, 1200.0, 1500.0],
+            }
+        )
+        service._fetch_histories_for_symbols = lambda symbols, **kwargs: ({"RELIANCE": df}, [])  # type: ignore[method-assign]
+
+        payload = service.find_gap_up_candidates(["RELIANCE"], min_gap_pct=5.0)
+
+        self.assertEqual(payload["summary"]["match_count"], 1)
+        self.assertGreater(payload["matches"][0]["gap_pct"], 5.0)
+
+    def test_find_unusual_volume_matches(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=6, freq="D"),
+                "open": [100.0] * 6,
+                "high": [101.0] * 6,
+                "low": [99.0] * 6,
+                "close": [100.5] * 6,
+                "volume": [100.0, 102.0, 98.0, 101.0, 99.0, 250.0],
+            }
+        )
+        service._fetch_histories_for_symbols = lambda symbols, **kwargs: ({"RELIANCE": df}, [])  # type: ignore[method-assign]
+
+        payload = service.find_unusual_volume(["RELIANCE"], timeframe="1d", start_date="", end_date="", lookback_bars=5, min_spike_ratio=2.0)
+
+        self.assertEqual(payload["summary"]["match_count"], 1)
+        self.assertGreaterEqual(payload["matches"][0]["spike_ratio"], 2.0)
+
+    def test_find_oi_build_up_uses_atm_chain_snapshot(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        service.option_chain = lambda symbol, **kwargs: {  # type: ignore[method-assign]
+            "expiry": "20260512",
+            "atm": 24350.0,
+            "current_price": 24320.0,
+            "calls": [{"sp": 24350.0, "ref_id": 1, "oi": 1500, "prev_oi": 1000, "iv": 0.2, "ltp": 120.0}],
+            "puts": [{"sp": 24350.0, "ref_id": 2, "oi": 1800, "prev_oi": 1000, "iv": 0.22, "ltp": 115.0}],
+        }
+
+        payload = service.find_oi_build_up(["NIFTY"], min_combined_oi_change_pct=20.0)
+
+        self.assertEqual(payload["summary"]["match_count"], 1)
+        self.assertEqual(payload["matches"][0]["build_up_bias"], "two_sided_build_up")
+
+    def test_find_iv_expansion_aggregates_legs(self) -> None:
+        service = NubraService(DummyPortfolioClient())
+        service._resolve_atm_option_symbols = lambda symbols, **kwargs: (  # type: ignore[method-assign]
+            ["NIFTY_CE", "NIFTY_PE"],
+            {
+                "NIFTY_CE": {"underlying": "NIFTY", "option_type": "CE", "expiry": "20260512", "atm_strike": 24350.0},
+                "NIFTY_PE": {"underlying": "NIFTY", "option_type": "PE", "expiry": "20260512", "atm_strike": 24350.0},
+            },
+        )
+
+        def point(ts, value):
+            return {"ts": ts, "v": value}
+
+        base_ts = [int(pd.Timestamp(f"2026-01-0{i}T00:00:00Z").value) for i in range(1, 5)]
+        service.historical_data = lambda *args, **kwargs: {  # type: ignore[method-assign]
+            "result": [
+                {
+                    "values": [
+                        {"NIFTY_CE": {"iv_mid": [point(base_ts[0], 0.10), point(base_ts[1], 0.11), point(base_ts[2], 0.12), point(base_ts[3], 0.20)]}},
+                        {"NIFTY_PE": {"iv_mid": [point(base_ts[0], 0.12), point(base_ts[1], 0.13), point(base_ts[2], 0.14), point(base_ts[3], 0.22)]}},
+                    ]
+                }
+            ]
+        }
+
+        payload = service.find_iv_expansion(["NIFTY"], lookback_bars=3, min_expansion_ratio=1.4)
+
+        self.assertEqual(payload["summary"]["match_count"], 1)
+        self.assertGreaterEqual(payload["matches"][0]["expansion_ratio"], 1.4)
+
+
 class BacktestTests(unittest.TestCase):
     def _sample_backtest_df(self):
         return pd.DataFrame(
@@ -858,6 +1237,8 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(payload["strategy_type"], "ma_crossover")
         self.assertIn("total_return_pct", payload)
         self.assertIn("trade_count", payload)
+        self.assertIn("equity_curve_image", payload)
+        self.assertTrue(Path(payload["equity_curve_image"]["image_path"]).exists())
 
     def test_export_backtest_report_and_image_write_files(self) -> None:
         service = NubraService(DummyPortfolioClient())

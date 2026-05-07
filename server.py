@@ -34,7 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 from config import Settings, configure_logging
 from nubra_client import NubraClient, NubraService
-from tools import account, analytics, auth, backtest, journal, options, orders, portfolio, quotes, risk, screener, talib_tools
+from tools import account, analytics, auth, backtest, journal, options, orders, portfolio, quotes, risk, screener, talib_tools, ui
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ def register_tools(mcp: FastMCP, service: NubraService) -> None:
     analytics.register(mcp, service)
     talib_tools.register(mcp, service)
     orders.register(mcp, service)
+    ui.register(mcp, service)
 
 
 def create_app(settings: Settings, mcp: FastMCP) -> FastAPI:

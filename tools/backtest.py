@@ -25,6 +25,30 @@ def _failure(tool: str, exc: Exception) -> dict[str, Any]:
 
 def register(mcp: Any, service: NubraService) -> None:
     @mcp.tool()
+    def get_strategy_backtest_catalog() -> dict[str, Any]:
+        """Return the NubraOSS-style indicator/operator catalog and a default strategy backtest payload template."""
+        try:
+            return _success("get_strategy_backtest_catalog", service.get_strategy_backtest_catalog())
+        except Exception as exc:
+            return _failure("get_strategy_backtest_catalog", exc)
+
+    @mcp.tool()
+    def validate_strategy_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate a NubraOSS-style strategy backtest payload before running it."""
+        try:
+            return _success("validate_strategy_backtest_payload", service.validate_strategy_backtest_payload(payload))
+        except Exception as exc:
+            return _failure("validate_strategy_backtest_payload", exc)
+
+    @mcp.tool()
+    def run_strategy_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+        """Run a NubraOSS-style rule-based strategy backtest using the current Nubra login/session and Nubra historical data only."""
+        try:
+            return _success("run_strategy_backtest", service.run_strategy_backtest(payload))
+        except Exception as exc:
+            return _failure("run_strategy_backtest", exc)
+
+    @mcp.tool()
     def run_backtest(
         symbol: str,
         timeframe: str,

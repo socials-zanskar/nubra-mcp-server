@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
 import csv
 import html
+import importlib
 import io
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -22,6 +26,12 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from config import Settings
+from strategy_backtest_engine import (
+    catalog_payload as strategy_catalog_payload,
+    default_strategy_template as strategy_default_template,
+    run_strategy_backtest as run_strategy_backtest_engine,
+    validate_strategy_payload as validate_strategy_backtest_payload_engine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -549,6 +559,7 @@ class NubraClient:
         self._historical_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._last_auth_probe_at: float | None = None
         self._last_auth_probe_ok = False
+        self._collector_python_runtime: str | None = None
         self.session = requests.Session()
 
     def _load_state(self) -> AuthState:
@@ -694,6 +705,187 @@ class NubraClient:
                 "Before using protected tools, call auth_status. If requires_login is true, "
                 "ask for phone number, then OTP, then MPIN, and call send_otp, verify_otp, verify_mpin in that order."
             ),
+        }
+
+    def _load_collector_session_adapter(self) -> Any:
+        collector_root = self.settings.collector_root_path
+        if not collector_root.exists():
+            raise NubraAPIError(f"NubraCollector repo not found at {collector_root}")
+        collector_root_str = str(collector_root)
+        if collector_root_str not in sys.path:
+            sys.path.insert(0, collector_root_str)
+        try:
+            return importlib.import_module("nubracollector.session_adapter")
+        except Exception as exc:
+            raise NubraAPIError(f"Unable to load NubraCollector session adapter: {exc}") from exc
+
+    def _has_reusable_local_session(self) -> bool:
+        return bool(self.state.authenticated and self.state.auth_token and self.state.session_token)
+
+    def _probe_collector_python(self, executable: str, collector_root: Path) -> bool:
+        probe_executable = executable
+        lower_exec = executable.lower()
+        if sys.platform.startswith("win") and lower_exec.endswith("pythonw.exe"):
+            sibling_python = str(Path(executable).with_name("python.exe"))
+            if Path(sibling_python).exists():
+                probe_executable = sibling_python
+        elif sys.platform.startswith("win") and lower_exec.endswith("pyw.exe"):
+            sibling_py = str(Path(executable).with_name("py.exe"))
+            if Path(sibling_py).exists():
+                probe_executable = sibling_py
+
+        try:
+            completed = subprocess.run(
+                [probe_executable, "-c", "import PySide6; import nubracollector"],
+                cwd=str(collector_root),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            return completed.returncode == 0
+        except Exception:
+            return False
+
+    def _resolve_collector_python(self, collector_root: Path) -> str:
+        if self._collector_python_runtime:
+            return self._collector_python_runtime
+
+        candidates: list[str] = []
+        configured_python = self.settings.collector_python_path
+        if configured_python:
+            candidates.append(str(configured_python))
+
+        if sys.platform.startswith("win"):
+            for name in ("pythonw.exe", "python.exe"):
+                candidate = collector_root / ".venv" / "Scripts" / name
+                if candidate.exists():
+                    candidates.append(str(candidate))
+        else:
+            for name in ("python3", "python"):
+                candidate = collector_root / ".venv" / "bin" / name
+                if candidate.exists():
+                    candidates.append(str(candidate))
+
+        launchers = ("pythonw", "python", "pyw", "py") if sys.platform.startswith("win") else ("python3", "python")
+        for launcher in launchers:
+            resolved = shutil.which(launcher)
+            if resolved:
+                candidates.append(resolved)
+
+        if sys.executable:
+            candidates.append(sys.executable)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = os.path.normcase(candidate)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if self._probe_collector_python(candidate, collector_root):
+                self._collector_python_runtime = candidate
+                return candidate
+
+        raise NubraAPIError(
+            "Could not find a Python runtime for NubraCollector with both PySide6 and the collector package available."
+        )
+
+    def _build_detached_popen_kwargs(self) -> dict[str, Any]:
+        if sys.platform.startswith("win"):
+            creationflags = 0
+            creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            return {"creationflags": creationflags}
+        return {"start_new_session": True}
+
+    def open_nubracollector_ui(self) -> dict[str, Any]:
+        collector_root = self.settings.collector_root_path
+        adapter = self._load_collector_session_adapter()
+
+        reused_session = False
+        token_store_path = ""
+        if self._has_reusable_local_session():
+            token_store_path = adapter.seed_shared_session(
+                auth_token=self.state.auth_token,
+                session_token=self.state.session_token,
+                device_id=self._device_id(),
+            )
+            reused_session = True
+
+        runtime = self._resolve_collector_python(collector_root)
+        launch_env = os.environ.copy()
+        launch_env[adapter.AUTO_CONNECT_ENV_VAR] = "1" if reused_session else "0"
+        launch_env[adapter.AUTO_CONNECT_ENV_NAME] = self.state.environment or "PROD"
+        if self.state.phone:
+            launch_env[adapter.AUTO_CONNECT_PHONE_ENV_NAME] = self.state.phone
+            launch_env["PHONE_NO"] = self.state.phone
+            launch_env["PHONE"] = self.state.phone
+        if self.settings.mpin:
+            launch_env[adapter.AUTO_CONNECT_MPIN_ENV_NAME] = self.settings.mpin
+            launch_env["MPIN"] = self.settings.mpin
+
+        try:
+            process = subprocess.Popen(
+                [runtime, "-m", "nubracollector"],
+                cwd=str(collector_root),
+                env=launch_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **self._build_detached_popen_kwargs(),
+            )
+        except Exception as exc:
+            raise NubraAPIError(f"Failed to launch NubraCollector UI: {exc}") from exc
+
+        return {
+            "message": (
+                "NubraCollector historical export UI launched using the current Nubra session."
+                if reused_session
+                else "NubraCollector historical export UI launched. No active shared session was available, so the UI may ask for login."
+            ),
+            "collector_root": str(collector_root),
+            "runtime": runtime,
+            "environment": self.state.environment,
+            "session_reused": reused_session,
+            "requires_login": not reused_session,
+            "token_store_seeded": reused_session,
+            "token_store_path": token_store_path if reused_session else "",
+            "pid": process.pid,
+        }
+
+    def open_backtest_ui(self) -> dict[str, Any]:
+        ui_script = Path(__file__).resolve().parent / "backtest_ui.py"
+        if not ui_script.exists():
+            raise NubraAPIError(f"Backtest UI script not found at {ui_script}")
+
+        runtime = sys.executable
+        current_exec = Path(sys.executable)
+        if sys.platform.startswith("win") and current_exec.name.lower() == "python.exe":
+            candidate = current_exec.with_name("pythonw.exe")
+            if candidate.exists():
+                runtime = str(candidate)
+
+        launch_env = os.environ.copy()
+        launch_env["NUBRA_BACKTEST_UI_ENV"] = "PROD"
+        try:
+            process = subprocess.Popen(
+                [runtime, str(ui_script)],
+                cwd=str(ui_script.parent),
+                env=launch_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **self._build_detached_popen_kwargs(),
+            )
+        except Exception as exc:
+            raise NubraAPIError(f"Failed to launch Backtest UI: {exc}") from exc
+
+        return {
+            "message": "Backtest UI launched in PROD mode. It will use the current PROD Nubra MCP auth state when available.",
+            "runtime": runtime,
+            "environment": "PROD",
+            "script": str(ui_script),
+            "pid": process.pid,
         }
 
     def set_environment(self, environment: str) -> dict[str, Any]:
@@ -1352,6 +1544,8 @@ class NubraService:
 
     def __init__(self, client: NubraClient) -> None:
         self.client = client
+        self._history_df_cache: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
+        self._option_chain_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 
     def _build_file_export_metadata(
         self,
@@ -1380,6 +1574,179 @@ class NubraService:
         if preview_rows is not None:
             metadata["preview_rows"] = preview_rows
         return metadata
+
+    def _cache_get(self, cache: dict[tuple[Any, ...], tuple[float, Any]], key: tuple[Any, ...], *, ttl_seconds: float) -> Any | None:
+        cached = cache.get(key)
+        if not cached:
+            return None
+        cached_at, value = cached
+        if time.time() - cached_at > ttl_seconds:
+            cache.pop(key, None)
+            return None
+        return value
+
+    def _cache_set(self, cache: dict[tuple[Any, ...], tuple[float, Any]], key: tuple[Any, ...], value: Any) -> None:
+        cache[key] = (time.time(), value)
+
+    def _normalize_symbol_list(self, symbols: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            item = str(symbol or "").strip().upper()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            normalized.append(item)
+        return normalized
+
+    def _extract_margin_snapshot(self, funds_payload: dict[str, Any]) -> dict[str, Any]:
+        funds_root = funds_payload.get("funds", funds_payload)
+        if isinstance(funds_root, dict):
+            if isinstance(funds_root.get("port_funds_and_margin"), dict):
+                return funds_root.get("port_funds_and_margin") or {}
+            if "start_of_day_funds" in funds_root or "net_margin_available" in funds_root:
+                return funds_root
+        return {}
+
+    def _history_cache_key(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        exchange: str,
+        instrument_type: str,
+        warmup_bars: int,
+    ) -> tuple[Any, ...]:
+        environment = getattr(getattr(self.client, "state", None), "environment", None) or getattr(getattr(self.client, "settings", None), "environment", "UNKNOWN")
+        return (
+            environment,
+            symbol.strip().upper(),
+            timeframe.strip().lower(),
+            start_date,
+            end_date,
+            exchange.strip().upper(),
+            instrument_type.strip().upper(),
+            int(warmup_bars),
+        )
+
+    def _option_chain_cache_key(self, *, symbol: str, exchange: str, expiry: str | None) -> tuple[Any, ...]:
+        environment = getattr(getattr(self.client, "state", None), "environment", None) or getattr(getattr(self.client, "settings", None), "environment", "UNKNOWN")
+        return (
+            environment,
+            symbol.strip().upper(),
+            exchange.strip().upper(),
+            (expiry or "").strip(),
+        )
+
+    def _fetch_histories_for_symbols(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        exchange: str = "NSE",
+        instrument_type: str = "STOCK",
+        warmup_bars: int = 0,
+    ) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
+        normalized_symbols = self._normalize_symbol_list(symbols)
+        histories: dict[str, pd.DataFrame] = {}
+        errors: list[dict[str, Any]] = []
+
+        def _load(symbol: str) -> tuple[str, pd.DataFrame | None, str | None]:
+            try:
+                df = self._historical_to_df(
+                    symbol,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exchange=exchange,
+                    instrument_type=instrument_type,
+                    warmup_bars=warmup_bars,
+                )
+                return symbol, df, None
+            except Exception as exc:
+                return symbol, None, str(exc)
+
+        if len(normalized_symbols) <= 1:
+            for symbol in normalized_symbols:
+                item_symbol, df, error = _load(symbol)
+                if error or df is None:
+                    errors.append({"symbol": item_symbol, "reason": "historical_data_fetch_failed", "details": error})
+                    continue
+                histories[item_symbol] = df
+            return histories, errors
+
+        max_workers = min(8, len(normalized_symbols))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for item_symbol, df, error in executor.map(_load, normalized_symbols):
+                if error or df is None:
+                    errors.append({"symbol": item_symbol, "reason": "historical_data_fetch_failed", "details": error})
+                    continue
+                histories[item_symbol] = df
+        return histories, errors
+
+    def _portfolio_instruments(
+        self,
+        *,
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> list[dict[str, Any]]:
+        holdings = self.get_holdings().get("holdings", []) if include_holdings else []
+        positions_payload = self.get_positions() if include_positions else {
+            "stock_positions": [],
+            "fut_positions": [],
+            "opt_positions": [],
+            "close_positions": [],
+        }
+        positions = self._flatten_position_groups(positions_payload)
+
+        rows: list[dict[str, Any]] = []
+        for item in holdings:
+            rows.append(
+                {
+                    "symbol": str(item.get("symbol") or item.get("displayName") or item.get("asset")).strip().upper(),
+                    "quantity": _to_float(item.get("qty")),
+                    "signed_quantity": _to_float(item.get("qty")),
+                    "market_value": self._holding_market_value(item),
+                    "asset_type": str(item.get("asset_type") or "").strip().upper(),
+                    "derivative_type": str(item.get("derivative_type") or "STOCK").strip().upper(),
+                    "instrument_type": "STOCK",
+                    "classification": str(item.get("sector") or item.get("industry") or item.get("asset_type") or item.get("derivative_type") or "UNCLASSIFIED").strip().upper(),
+                    "classification_source": "sector" if item.get("sector") else "industry" if item.get("industry") else "asset_type_fallback",
+                    "source": "holding",
+                }
+            )
+
+        for item in positions:
+            side = str(item.get("order_side") or "BUY").strip().upper()
+            qty = _to_float(item.get("qty"))
+            signed_qty = -qty if side == "SELL" else qty
+            derivative_type = str(item.get("derivative_type") or "STOCK").strip().upper()
+            instrument_type = "STOCK"
+            if derivative_type == "FUT":
+                instrument_type = "FUT"
+            elif derivative_type == "OPT":
+                instrument_type = "OPT"
+            elif derivative_type == "INDEX":
+                instrument_type = "INDEX"
+            rows.append(
+                {
+                    "symbol": str(item.get("symbol") or item.get("display_name") or item.get("asset")).strip().upper(),
+                    "quantity": qty,
+                    "signed_quantity": signed_qty,
+                    "market_value": self._position_market_value(item),
+                    "asset_type": str(item.get("asset_type") or "").strip().upper(),
+                    "derivative_type": derivative_type,
+                    "instrument_type": instrument_type,
+                    "classification": str(item.get("sector") or item.get("industry") or item.get("asset_type") or derivative_type or "UNCLASSIFIED").strip().upper(),
+                    "classification_source": "sector" if item.get("sector") else "industry" if item.get("industry") else "asset_type_fallback",
+                    "source": "position",
+                }
+            )
+        return [row for row in rows if row["symbol"]]
 
     def _build_order_preview(
         self,
@@ -1492,6 +1859,21 @@ class NubraService:
 
     def set_environment(self, environment: str) -> dict[str, Any]:
         return self.client.set_environment(environment)
+
+    def open_nubracollector_ui(self) -> dict[str, Any]:
+        return self.client.open_nubracollector_ui()
+
+    def get_strategy_backtest_catalog(self) -> dict[str, Any]:
+        return self.client.get_strategy_backtest_catalog()
+
+    def validate_strategy_backtest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.client.validate_strategy_backtest_payload(payload)
+
+    def run_strategy_backtest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.client.run_strategy_backtest(payload)
+
+    def open_backtest_ui(self) -> dict[str, Any]:
+        return self.client.open_backtest_ui()
 
     def connect_nubra_mcp(self, phone: str | None = None, mpin: str | None = None, environment: str = "PROD") -> dict[str, Any]:
         return self.client.connect_nubra_mcp(phone=phone, mpin=mpin, environment=environment)
@@ -1810,9 +2192,13 @@ class NubraService:
         return payload
 
     def option_chain(self, symbol: str, *, exchange: str = "NSE", expiry: str | None = None) -> dict[str, Any]:
+        cache_key = self._option_chain_cache_key(symbol=symbol, exchange=exchange, expiry=expiry)
+        cached = self._cache_get(self._option_chain_cache, cache_key, ttl_seconds=10.0)
+        if cached is not None:
+            return copy.deepcopy(cached)
         chain = self.client.get_option_chain(symbol, exchange=exchange, expiry=expiry)
         payload = chain.get("chain", {})
-        return {
+        result = {
             "data_source": "nubra",
             "market_data_environment_recommendation": "Use PROD for market data to access the most complete data coverage.",
             "asset": payload.get("asset", symbol.upper()),
@@ -1826,6 +2212,8 @@ class NubraService:
             "calls": payload.get("ce", []),
             "puts": payload.get("pe", []),
         }
+        self._cache_set(self._option_chain_cache, cache_key, copy.deepcopy(result))
+        return result
 
     def historical_data(
         self,
@@ -1844,7 +2232,9 @@ class NubraService:
         if normalized_timeframe not in ALLOWED_INTERVALS:
             allowed = ", ".join(sorted(ALLOWED_INTERVALS))
             raise ValueError(f"timeframe must be one of: {allowed}.")
-        use_intraday = intraday if intraday is not None else timeframe not in {"1d", "1w", "1mt"}
+        # Nubra's historical endpoint returns broader archival data for intraday
+        # intervals when intraDay=False. Callers can still opt into True explicitly.
+        use_intraday = intraday if intraday is not None else False
         effective_start, effective_end = _default_history_window(
             normalized_timeframe,
             start_date=start_date,
@@ -3118,7 +3508,8 @@ class NubraService:
                 risk_flags.append(f"High concentration: {exposures[0]['group']} is {top_weight:.2f}% of tracked market value.")
         if position_groups["opt_positions"]:
             risk_flags.append(f"Options exposure present across {len(position_groups['opt_positions'])} open option positions.")
-        net_margin_available = _to_float(((funds_payload.get("funds") or {}).get("port_funds_and_margin") or {}).get("net_margin_available"))
+        margin_snapshot_raw = self._extract_margin_snapshot(funds_payload)
+        net_margin_available = _to_float(margin_snapshot_raw.get("net_margin_available"))
         if include_funds and net_margin_available < 0:
             risk_flags.append("Net margin available is negative.")
 
@@ -3137,7 +3528,7 @@ class NubraService:
             "holding_stats": holdings_payload.get("holding_stats", {}),
             "position_stats": positions_payload.get("position_stats", {}),
             "margin_snapshot": _with_display_fields(
-                ((funds_payload.get("funds") or {}).get("port_funds_and_margin") or {}),
+                margin_snapshot_raw,
                 ["start_of_day_funds", "net_margin_available", "total_margin_blocked", "mtm_deriv", "mtm_eq_iday_cnc", "mtm_eq_delivery"],
             ),
             "top_gainers": gainers,
@@ -3524,8 +3915,56 @@ class NubraService:
             )
             matches = result.get("matches", [])
             ranking = matches
+        elif normalized_scan == "gap_up":
+            result = self.find_gap_up_candidates(
+                symbols,
+                timeframe=str(settings.get("timeframe", "1d")),
+                start_date=str(settings.get("start_date", "")),
+                end_date=str(settings.get("end_date", "")),
+                exchange=exchange,
+                instrument_type=str(settings.get("instrument_type", "STOCK")),
+                min_gap_pct=_to_float(settings.get("min_gap_pct"), 1.0),
+                require_green_candle=bool(settings.get("require_green_candle", False)),
+            )
+            matches = result.get("matches", [])
+            ranking = matches
+        elif normalized_scan == "unusual_volume":
+            result = self.find_unusual_volume(
+                symbols,
+                timeframe=str(settings.get("timeframe", "1d")),
+                start_date=str(settings.get("start_date", "")),
+                end_date=str(settings.get("end_date", "")),
+                exchange=exchange,
+                instrument_type=str(settings.get("instrument_type", "STOCK")),
+                lookback_bars=_to_int(settings.get("lookback_bars"), 20),
+                min_spike_ratio=_to_float(settings.get("min_spike_ratio"), 1.5),
+                min_zscore=_to_float(settings.get("min_zscore"), 2.0),
+            )
+            matches = result.get("matches", [])
+            ranking = matches
+        elif normalized_scan == "oi_build_up":
+            result = self.find_oi_build_up(
+                symbols,
+                exchange=exchange,
+                expiry=settings.get("expiry"),
+                min_combined_oi_change_pct=_to_float(settings.get("min_combined_oi_change_pct"), 5.0),
+            )
+            matches = result.get("matches", [])
+            ranking = matches
+        elif normalized_scan == "iv_expansion":
+            result = self.find_iv_expansion(
+                symbols,
+                timeframe=str(settings.get("timeframe", "1d")),
+                start_date=str(settings.get("start_date", "")),
+                end_date=str(settings.get("end_date", "")),
+                exchange=exchange,
+                lookback_bars=_to_int(settings.get("lookback_bars"), 10),
+                min_expansion_ratio=_to_float(settings.get("min_expansion_ratio"), 1.1),
+            )
+            matches = result.get("matches", [])
+            ranking = matches
         else:
-            raise ValueError("scan_type must be one of volume_spike, volume_breakout, rsi_threshold, ema_crossover, oi_wall, return_rank.")
+            raise ValueError("scan_type must be one of volume_spike, volume_breakout, unusual_volume, gap_up, rsi_threshold, ema_crossover, oi_wall, oi_build_up, iv_expansion, return_rank.")
 
         matched_symbols = {str(item.get("symbol") or item.get("underlying") or "").strip().upper() for item in matches if isinstance(item, dict)}
         non_matches = [symbol for symbol in symbols if symbol.strip().upper() not in matched_symbols]
@@ -3719,7 +4158,7 @@ class NubraService:
         holdings_payload = self.get_holdings()
         funds_payload = self.get_funds() if include_margin else {"funds": {}}
         holdings = holdings_payload.get("holdings", [])
-        funds = (funds_payload.get("funds") or {}).get("port_funds_and_margin") or {}
+        funds = self._extract_margin_snapshot(funds_payload)
         pledgeable_holdings = []
         if include_pledgeable_holdings:
             pledgeable_holdings = [
@@ -3758,6 +4197,244 @@ class NubraService:
             ),
             "cash_pressure_flags": cash_pressure_flags,
             "margin_risk_flags": cash_pressure_flags,
+        }
+
+    def get_portfolio_sector_exposure(
+        self,
+        *,
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        components = self._portfolio_instruments(include_holdings=include_holdings, include_positions=include_positions)
+        grouped: dict[str, dict[str, Any]] = {}
+        fallback_used = False
+        total_market_value = sum(max(_to_float(item.get("market_value")), 0.0) for item in components)
+        for item in components:
+            bucket = str(item.get("classification") or "UNCLASSIFIED").strip().upper() or "UNCLASSIFIED"
+            if str(item.get("classification_source")) != "sector":
+                fallback_used = True
+            entry = grouped.setdefault(
+                bucket,
+                {"bucket": bucket, "market_value": 0.0, "gross_quantity": 0.0, "symbols": set(), "sources": set(), "classification_sources": set()},
+            )
+            entry["market_value"] += _to_float(item.get("market_value"))
+            entry["gross_quantity"] += abs(_to_float(item.get("signed_quantity")))
+            entry["symbols"].add(str(item.get("symbol")))
+            entry["sources"].add(str(item.get("source")))
+            entry["classification_sources"].add(str(item.get("classification_source")))
+        rows = []
+        for entry in grouped.values():
+            market_value = round(_to_float(entry["market_value"]), 2)
+            rows.append(
+                {
+                    "bucket": entry["bucket"],
+                    "market_value": market_value,
+                    "market_value_display": _format_rupees(market_value),
+                    "portfolio_weight_pct": round((market_value / total_market_value) * 100.0, 4) if total_market_value > 0 else 0.0,
+                    "gross_quantity": round(_to_float(entry["gross_quantity"]), 4),
+                    "symbols": sorted(entry["symbols"]),
+                    "sources": sorted(entry["sources"]),
+                    "classification_sources": sorted(entry["classification_sources"]),
+                }
+            )
+        rows.sort(key=lambda row: row["market_value"], reverse=True)
+        return {
+            "data_source": "nubra",
+            "grouping_label": "sector_like_bucket",
+            "fallback_used": fallback_used,
+            "note": "Nubra's current instrument payload does not reliably expose true sector metadata, so this groups exposure by the closest available classification from sector/industry fields when present, otherwise asset_type/derivative_type.",
+            "rows": rows,
+            "summary": {"bucket_count": len(rows), "total_market_value": round(total_market_value, 2), "total_market_value_display": _format_rupees(round(total_market_value, 2))},
+        }
+
+    def get_portfolio_concentration_risk(
+        self,
+        *,
+        top_n: int = 5,
+    ) -> dict[str, Any]:
+        exposures = self.get_top_exposures(limit=max(1, top_n), group_by="symbol").get("exposures", [])
+        all_rows = self._build_exposure_rows(
+            holdings=self.get_holdings().get("holdings", []),
+            positions=self._flatten_position_groups(self.get_positions()),
+            group_by="symbol",
+        )
+        weights = [max(_to_float(row.get("portfolio_weight_pct")), 0.0) / 100.0 for row in all_rows]
+        hhi = round(sum(weight * weight for weight in weights), 6)
+        effective_positions = round((1.0 / hhi), 4) if hhi > 0 else None
+        largest_weight = round(_to_float(all_rows[0].get("portfolio_weight_pct")) if all_rows else 0.0, 4)
+        flags: list[str] = []
+        if largest_weight >= 40:
+            flags.append("Largest single-name exposure is above 40% of tracked market value.")
+        if hhi >= 0.18:
+            flags.append("Portfolio concentration is high on an HHI basis.")
+        elif hhi >= 0.10:
+            flags.append("Portfolio concentration is moderate on an HHI basis.")
+        return {
+            "data_source": "nubra",
+            "largest_single_name_pct": largest_weight,
+            "top_exposures": exposures,
+            "hhi": hhi,
+            "effective_positions": effective_positions,
+            "risk_flags": flags,
+        }
+
+    def get_portfolio_rolling_drawdown(
+        self,
+        *,
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        exchange: str = "NSE",
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        components = self._portfolio_instruments(include_holdings=include_holdings, include_positions=include_positions)
+        if not components:
+            raise NubraAPIError("No portfolio instruments available to compute drawdown.")
+
+        grouped_components: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in components:
+            key = (str(item["symbol"]), str(item["instrument_type"]))
+            entry = grouped_components.setdefault(key, {**item, "signed_quantity": 0.0})
+            entry["signed_quantity"] += _to_float(item.get("signed_quantity"))
+            entry["market_value"] += _to_float(item.get("market_value"))
+
+        history_by_component: dict[tuple[str, str], pd.DataFrame] = {}
+        errors: list[dict[str, Any]] = []
+        by_type: dict[str, list[str]] = {}
+        for symbol, instrument_type in grouped_components:
+            by_type.setdefault(instrument_type, []).append(symbol)
+        for instrument_type, symbols in by_type.items():
+            histories, batch_errors = self._fetch_histories_for_symbols(
+                symbols,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+            errors.extend(batch_errors)
+            for symbol, df in histories.items():
+                history_by_component[(symbol, instrument_type)] = df
+
+        component_series: list[pd.Series] = []
+        for key, component in grouped_components.items():
+            df = history_by_component.get(key)
+            if df is None or df.empty:
+                continue
+            series = pd.Series(
+                pd.to_numeric(df["close"], errors="coerce").values * _to_float(component.get("signed_quantity")),
+                index=pd.DatetimeIndex(pd.to_datetime(df["timestamp"])),
+                name=f"{component['symbol']}:{component['instrument_type']}",
+            )
+            component_series.append(series)
+        if not component_series:
+            raise NubraAPIError("Historical price data was unavailable for all current portfolio components.", details={"errors": errors})
+
+        value_frame = pd.concat(component_series, axis=1).sort_index().ffill().fillna(0.0)
+        portfolio_value = value_frame.sum(axis=1)
+        running_max = portfolio_value.cummax()
+        drawdown_pct = ((portfolio_value / running_max) - 1.0) * 100.0
+        max_drawdown_pct = round(abs(_to_float(drawdown_pct.min())), 4)
+        current_drawdown_pct = round(_to_float(drawdown_pct.iloc[-1]), 4)
+        trough_time = str(drawdown_pct.idxmin()) if not drawdown_pct.empty else None
+        preview = pd.DataFrame(
+            {
+                "timestamp": portfolio_value.index.astype(str),
+                "portfolio_value": portfolio_value.round(2).values,
+                "running_peak": running_max.round(2).values,
+                "drawdown_pct": drawdown_pct.round(4).values,
+            }
+        ).tail(10)
+        return {
+            "data_source": "nubra",
+            "timeframe": timeframe,
+            "start_date": start_date,
+            "end_date": end_date,
+            "component_count": len(component_series),
+            "max_drawdown_pct": max_drawdown_pct,
+            "current_drawdown_pct": current_drawdown_pct,
+            "drawdown_trough_timestamp": trough_time,
+            "note": "This drawdown series uses current portfolio quantities projected across the selected historical window.",
+            "history_gaps": errors,
+            "preview_rows": preview.to_dict(orient="records"),
+        }
+
+    def get_portfolio_correlation_matrix(
+        self,
+        *,
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        exchange: str = "NSE",
+        include_holdings: bool = True,
+        include_positions: bool = True,
+    ) -> dict[str, Any]:
+        components = self._portfolio_instruments(include_holdings=include_holdings, include_positions=include_positions)
+        unique_components: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in components:
+            key = (str(item["symbol"]), str(item["instrument_type"]))
+            unique_components.setdefault(key, item)
+        by_type: dict[str, list[str]] = {}
+        for symbol, instrument_type in unique_components:
+            by_type.setdefault(instrument_type, []).append(symbol)
+
+        history_by_component: dict[tuple[str, str], pd.DataFrame] = {}
+        errors: list[dict[str, Any]] = []
+        for instrument_type, symbols in by_type.items():
+            histories, batch_errors = self._fetch_histories_for_symbols(
+                symbols,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+            errors.extend(batch_errors)
+            for symbol, df in histories.items():
+                history_by_component[(symbol, instrument_type)] = df
+
+        price_series: list[pd.Series] = []
+        for key, component in unique_components.items():
+            df = history_by_component.get(key)
+            if df is None or df.empty:
+                continue
+            label = component["symbol"] if component["instrument_type"] == "STOCK" else f"{component['symbol']}:{component['instrument_type']}"
+            price_series.append(
+                pd.Series(
+                    pd.to_numeric(df["close"], errors="coerce").values,
+                    index=pd.DatetimeIndex(pd.to_datetime(df["timestamp"])),
+                    name=label,
+                )
+            )
+        if len(price_series) < 2:
+            raise NubraAPIError("At least two portfolio instruments with historical data are required for correlation analysis.", details={"errors": errors})
+
+        price_frame = pd.concat(price_series, axis=1).sort_index().ffill().dropna(how="all")
+        returns = price_frame.pct_change().replace([float("inf"), float("-inf")], pd.NA).dropna(how="all")
+        correlation = returns.corr().round(4)
+        matrix_rows = []
+        for label, row in correlation.iterrows():
+            matrix_rows.append({"symbol": label, **{col: (None if pd.isna(val) else float(val)) for col, val in row.items()}})
+        pairs: list[dict[str, Any]] = []
+        columns = list(correlation.columns)
+        for idx, left in enumerate(columns):
+            for right in columns[idx + 1:]:
+                value = correlation.loc[left, right]
+                if pd.isna(value):
+                    continue
+                pairs.append({"left": left, "right": right, "correlation": round(float(value), 4), "abs_correlation": round(abs(float(value)), 4)})
+        pairs.sort(key=lambda row: row["abs_correlation"], reverse=True)
+        return {
+            "data_source": "nubra",
+            "timeframe": timeframe,
+            "start_date": start_date,
+            "end_date": end_date,
+            "component_count": len(price_series),
+            "matrix": matrix_rows,
+            "top_pairs": pairs[:10],
+            "history_gaps": errors,
+            "note": "Correlation is based on percentage returns of current portfolio constituents over the selected window.",
         }
 
     def _render_html_table(self, rows: list[dict[str, Any]], columns: list[str]) -> str:
@@ -4217,6 +4894,115 @@ class NubraService:
                 return close
         return close
 
+    def _backtest_requested_window(
+        self,
+        *,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+    ) -> tuple[pd.Timestamp, pd.Timestamp]:
+        effective_start, effective_end = _default_history_window(
+            timeframe,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        requested_start = pd.Timestamp(effective_start).tz_convert("Asia/Kolkata")
+        requested_end = pd.Timestamp(effective_end).tz_convert("Asia/Kolkata")
+        return requested_start, requested_end
+
+    def _estimate_backtest_fetch_start(
+        self,
+        requested_start: pd.Timestamp,
+        *,
+        timeframe: str,
+        warmup_bars: int,
+    ) -> pd.Timestamp:
+        normalized = timeframe.strip().lower()
+        if warmup_bars <= 0:
+            return requested_start
+        if normalized == "1mt":
+            return requested_start - pd.DateOffset(months=warmup_bars + 3)
+        if normalized == "1w":
+            return requested_start - pd.Timedelta(days=max(28, warmup_bars * 10))
+        if normalized == "1d":
+            return requested_start - pd.offsets.BDay(warmup_bars + 5)
+        if normalized.endswith("h"):
+            hours = max(1, _to_int(normalized[:-1], 1))
+            return requested_start - pd.Timedelta(hours=hours * warmup_bars) - pd.Timedelta(days=3)
+        if normalized.endswith("m"):
+            minutes = max(1, _to_int(normalized[:-1], 1))
+            bars_per_session = max(1, 375 // minutes)
+            sessions = max(1, (warmup_bars + bars_per_session - 1) // bars_per_session)
+            return requested_start - pd.Timedelta(minutes=minutes * warmup_bars) - pd.Timedelta(days=max(3, sessions * 2 + 1))
+        if normalized.endswith("s"):
+            seconds = max(1, _to_int(normalized[:-1], 1))
+            bars_per_session = max(1, (375 * 60) // seconds)
+            sessions = max(1, (warmup_bars + bars_per_session - 1) // bars_per_session)
+            return requested_start - pd.Timedelta(seconds=seconds * warmup_bars) - pd.Timedelta(days=max(3, sessions * 2 + 1))
+        return requested_start
+
+    def _normalize_intraday_volume(self, df: pd.DataFrame) -> pd.Series:
+        volume = pd.to_numeric(df["volume"], errors="coerce")
+        if "timestamp" not in df.columns:
+            return volume.astype("float64")
+        day_keys = pd.to_datetime(df["timestamp"]).dt.normalize()
+        raw_diff = volume.diff()
+        session_reset = day_keys.ne(day_keys.shift()) | raw_diff.lt(0)
+        normalized = raw_diff.where(~session_reset, volume)
+        return normalized.astype("float64")
+
+    def _normalize_historical_payload_for_talib(self, payload: dict[str, Any], *, symbol: str) -> Any:
+        normalized_result: list[dict[str, Any]] = []
+        normalized_symbol = symbol.strip().upper()
+        for result_item in payload.get("result") or []:
+            normalized_values: list[dict[str, Any]] = []
+            for stock_data in result_item.get("values") or []:
+                if not isinstance(stock_data, dict):
+                    continue
+                symbol_chart = stock_data.get(normalized_symbol)
+                if not symbol_chart:
+                    continue
+                normalized_chart: dict[str, list[dict[str, Any]]] = {}
+                for field_name in ("open", "high", "low", "close", "cumulative_volume"):
+                    points = symbol_chart.get(field_name, []) or []
+                    normalized_chart[field_name] = [
+                        {"timestamp": int(point.get("ts", 0)), "value": point.get("v")}
+                        for point in points
+                        if point.get("ts") is not None
+                    ]
+                normalized_values.append({normalized_symbol: normalized_chart})
+            normalized_result.append({"values": normalized_values})
+        return {"result": normalized_result}
+
+    def _historical_payload_to_df(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str,
+        timeframe: str,
+    ) -> pd.DataFrame:
+        to_ohlcv_df, _ = self._load_talib_helpers()
+        normalized_symbol = symbol.strip().upper()
+        normalized_payload = self._normalize_historical_payload_for_talib(payload, symbol=normalized_symbol)
+        # Ask nubra_talib to preserve cumulative volume, then normalize it the same
+        # way NubraOSS does for intraday intervals.
+        df = to_ohlcv_df(
+            normalized_payload,
+            symbol=normalized_symbol,
+            tz="Asia/Kolkata",
+            paise_to_rupee=False,
+            interval="1d",
+        )
+        if df.empty:
+            return df
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+        normalized_timeframe = timeframe.strip().lower()
+        if normalized_timeframe != "1d":
+            df["volume"] = self._normalize_intraday_volume(df)
+        else:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("float64")
+        return df
+
     def _historical_to_df(
         self,
         symbol: str,
@@ -4226,58 +5012,47 @@ class NubraService:
         end_date: str,
         exchange: str = "NSE",
         instrument_type: str = "STOCK",
+        warmup_bars: int = 0,
     ) -> Any:
-        payload = self.historical_data(
-            symbol,
+        cache_key = self._history_cache_key(
+            symbol=symbol,
             timeframe=timeframe,
             start_date=start_date,
             end_date=end_date,
             exchange=exchange,
             instrument_type=instrument_type,
+            warmup_bars=warmup_bars,
+        )
+        cached = self._cache_get(self._history_df_cache, cache_key, ttl_seconds=120.0)
+        if cached is not None:
+            return cached.copy()
+        requested_start, requested_end = self._backtest_requested_window(
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        fetch_start = self._estimate_backtest_fetch_start(
+            requested_start,
+            timeframe=timeframe,
+            warmup_bars=warmup_bars,
+        )
+        payload = self.historical_data(
+            symbol,
+            timeframe=timeframe,
+            start_date=fetch_start.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            end_date=requested_end.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            exchange=exchange,
+            instrument_type=instrument_type,
             fields=["open", "high", "low", "close", "cumulative_volume"],
         )
-        normalized_symbol = symbol.strip().upper()
-        rows: list[dict[str, Any]] = []
-        for result in payload.get("result") or []:
-            values = result.get("values") or []
-            for stock_data in values:
-                if not isinstance(stock_data, dict):
-                    continue
-                stock_chart = stock_data.get(normalized_symbol)
-                if not stock_chart:
-                    continue
-                open_s = _historical_series_to_map(stock_chart.get("open"))
-                high_s = _historical_series_to_map(stock_chart.get("high"))
-                low_s = _historical_series_to_map(stock_chart.get("low"))
-                close_s = _historical_series_to_map(stock_chart.get("close"))
-                vol_s = _historical_series_to_map(stock_chart.get("cumulative_volume"))
-                all_ts = set(open_s) | set(high_s) | set(low_s) | set(close_s) | set(vol_s)
-                for ts in sorted(all_ts):
-                    rows.append(
-                        {
-                            "timestamp": ts,
-                            "open": open_s.get(ts),
-                            "high": high_s.get(ts),
-                            "low": low_s.get(ts),
-                            "close": close_s.get(ts),
-                            "volume": vol_s.get(ts),
-                        }
-                    )
-        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns", utc=True, errors="coerce")
-            df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-            for column in ("open", "high", "low", "close", "volume"):
-                df[column] = pd.to_numeric(df[column], errors="coerce")
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            if timeframe.strip().lower() != "1d":
-                df["volume"] = df["volume"].diff()
+        df = self._historical_payload_to_df(payload, symbol=symbol, timeframe=timeframe)
         if df is None or getattr(df, "empty", True):
             raise NubraAPIError(
                 f"No historical OHLCV data returned for '{symbol}'.",
                 details={"symbol": symbol, "timeframe": timeframe},
             )
-        return df
+        self._cache_set(self._history_df_cache, cache_key, df.copy())
+        return df.copy()
 
     def run_backtest(
         self,
@@ -4341,6 +5116,11 @@ class NubraService:
         if fast_window <= 0 or slow_window <= 0 or fast_window >= slow_window:
             raise ValueError("fast_window and slow_window must be positive, and fast_window must be smaller than slow_window.")
         vbt = self._load_vectorbt()
+        requested_start, requested_end = self._backtest_requested_window(
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+        )
         df = self._historical_to_df(
             symbol,
             timeframe=timeframe,
@@ -4348,10 +5128,23 @@ class NubraService:
             end_date=end_date,
             exchange=exchange,
             instrument_type=instrument_type,
+            warmup_bars=slow_window + 5,
         )
         close = self._close_series_for_backtest(df)
         fast_ma = close.rolling(window=fast_window).mean()
         slow_ma = close.rolling(window=slow_window).mean()
+        timestamp_index = pd.DatetimeIndex(pd.to_datetime(df["timestamp"]))
+        if timestamp_index.tz is None:
+            timestamp_index = timestamp_index.tz_localize("Asia/Kolkata")
+        else:
+            timestamp_index = timestamp_index.tz_convert("Asia/Kolkata")
+        execution_mask = (timestamp_index >= requested_start) & (timestamp_index <= requested_end)
+        if not bool(execution_mask.any()):
+            execution_mask = [True] * len(df)
+        mask_values = list(execution_mask)
+        close = close.iloc[mask_values]
+        fast_ma = fast_ma.iloc[mask_values]
+        slow_ma = slow_ma.iloc[mask_values]
         entries = fast_ma > slow_ma
         exits = fast_ma < slow_ma
         portfolio = vbt.Portfolio.from_signals(
@@ -4364,8 +5157,26 @@ class NubraService:
         )
         summary = self._summarize_backtest_portfolio(portfolio, symbol=symbol, strategy_type="ma_crossover", timeframe=timeframe)
         summary["strategy_params"] = {"fast_window": fast_window, "slow_window": slow_window, "initial_cash": initial_cash, "fees": fees}
-        summary["preview_rows"] = df.tail(5).to_dict(orient="records")
+        summary["preview_rows"] = df.iloc[mask_values].tail(5).to_dict(orient="records")
+        summary["equity_curve_image"] = self._render_backtest_equity_curve_image(
+            portfolio,
+            symbol=symbol,
+            strategy_type="ma_crossover",
+            timeframe=timeframe,
+        )
         return summary
+
+    def get_strategy_backtest_catalog(self) -> dict[str, Any]:
+        return {
+            "catalog": strategy_catalog_payload(),
+            "default_template": strategy_default_template(),
+        }
+
+    def validate_strategy_backtest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return validate_strategy_backtest_payload_engine(payload)
+
+    def run_strategy_backtest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return run_strategy_backtest_engine(self, payload)
 
     def run_rsi_backtest(
         self,
@@ -4385,6 +5196,11 @@ class NubraService:
         if rsi_window <= 0:
             raise ValueError("rsi_window must be greater than zero.")
         vbt = self._load_vectorbt()
+        requested_start, requested_end = self._backtest_requested_window(
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+        )
         df = self._historical_to_df(
             symbol,
             timeframe=timeframe,
@@ -4392,9 +5208,21 @@ class NubraService:
             end_date=end_date,
             exchange=exchange,
             instrument_type=instrument_type,
+            warmup_bars=rsi_window + 5,
         )
         close = self._close_series_for_backtest(df)
         rsi = vbt.RSI.run(close, window=rsi_window).rsi
+        timestamp_index = pd.DatetimeIndex(pd.to_datetime(df["timestamp"]))
+        if timestamp_index.tz is None:
+            timestamp_index = timestamp_index.tz_localize("Asia/Kolkata")
+        else:
+            timestamp_index = timestamp_index.tz_convert("Asia/Kolkata")
+        execution_mask = (timestamp_index >= requested_start) & (timestamp_index <= requested_end)
+        if not bool(execution_mask.any()):
+            execution_mask = [True] * len(df)
+        mask_values = list(execution_mask)
+        close = close.iloc[mask_values]
+        rsi = rsi.iloc[mask_values]
         entries = rsi < oversold
         exits = rsi > overbought
         portfolio = vbt.Portfolio.from_signals(
@@ -4413,7 +5241,13 @@ class NubraService:
             "initial_cash": initial_cash,
             "fees": fees,
         }
-        summary["preview_rows"] = df.tail(5).to_dict(orient="records")
+        summary["preview_rows"] = df.iloc[mask_values].tail(5).to_dict(orient="records")
+        summary["equity_curve_image"] = self._render_backtest_equity_curve_image(
+            portfolio,
+            symbol=symbol,
+            strategy_type="rsi",
+            timeframe=timeframe,
+        )
         return summary
 
     def export_backtest_report_html(
@@ -4486,10 +5320,6 @@ class NubraService:
         fees: float = 0.001,
         exchange: str = "NSE",
     ) -> dict[str, Any]:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
         normalized_strategy = strategy_type.strip().lower()
         params = strategy_params or {}
         if normalized_strategy == "ma_crossover":
@@ -4526,6 +5356,24 @@ class NubraService:
             )
         else:
             raise ValueError("strategy_type must be one of ma_crossover or rsi.")
+        return self._render_backtest_equity_curve_image(
+            portfolio,
+            symbol=symbol,
+            strategy_type=strategy_type,
+            timeframe=timeframe,
+        )
+
+    def _render_backtest_equity_curve_image(
+        self,
+        portfolio: Any,
+        *,
+        symbol: str,
+        strategy_type: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
         value_series = portfolio.value()
         export_root = Path(__file__).resolve().parent / "artifacts" / "backtests"
@@ -4805,6 +5653,325 @@ class NubraService:
             "min_volume_spike_ratio": min_volume_spike_ratio,
             "min_breakout_pct": min_breakout_pct,
             "require_close_breakout": require_close_breakout,
+            "matches": matches,
+            "rejected": rejected,
+            "summary": {"match_count": len(matches), "rejected_count": len(rejected)},
+        }
+
+    def find_gap_up_candidates(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        exchange: str = "NSE",
+        instrument_type: str = "STOCK",
+        min_gap_pct: float = 1.0,
+        require_green_candle: bool = False,
+    ) -> dict[str, Any]:
+        histories, rejected = self._fetch_histories_for_symbols(
+            symbols,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            exchange=exchange,
+            instrument_type=instrument_type,
+        )
+        matches: list[dict[str, Any]] = []
+        for symbol in self._normalize_symbol_list(symbols):
+            df = histories.get(symbol)
+            if df is None:
+                continue
+            if len(df) < 2:
+                rejected.append({"symbol": symbol, "reason": "insufficient_bars", "required_bars": 2, "available_bars": int(len(df))})
+                continue
+            previous = df.iloc[-2]
+            latest = df.iloc[-1]
+            previous_close = round(float(previous["close"]), 2)
+            latest_open = round(float(latest["open"]), 2)
+            latest_close = round(float(latest["close"]), 2)
+            gap_pct = round(((latest_open - previous_close) / previous_close) * 100.0, 4) if previous_close else None
+            green_candle = latest_close >= latest_open
+            row = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": str(latest["timestamp"]),
+                "previous_close": previous_close,
+                "previous_close_display": _format_rupees(previous_close),
+                "latest_open": latest_open,
+                "latest_open_display": _format_rupees(latest_open),
+                "latest_close": latest_close,
+                "latest_close_display": _format_rupees(latest_close),
+                "gap_pct": gap_pct,
+                "green_candle": green_candle,
+                "strategy_match": bool(gap_pct is not None and gap_pct >= min_gap_pct and (green_candle or not require_green_candle)),
+            }
+            if row["strategy_match"]:
+                matches.append(row)
+            else:
+                reasons: list[str] = []
+                if gap_pct is None or gap_pct < min_gap_pct:
+                    reasons.append("gap_threshold_not_met")
+                if require_green_candle and not green_candle:
+                    reasons.append("green_candle_not_confirmed")
+                rejected.append({**row, "reason": ", ".join(reasons) if reasons else "not_matched"})
+        matches.sort(key=lambda row: row.get("gap_pct") or float("-inf"), reverse=True)
+        return {
+            "data_source": "nubra",
+            "strategy": "gap_up",
+            "timeframe": timeframe,
+            "min_gap_pct": min_gap_pct,
+            "require_green_candle": require_green_candle,
+            "matches": matches,
+            "rejected": rejected,
+            "summary": {"match_count": len(matches), "rejected_count": len(rejected)},
+        }
+
+    def find_unusual_volume(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        exchange: str = "NSE",
+        instrument_type: str = "STOCK",
+        lookback_bars: int = 20,
+        min_spike_ratio: float = 1.5,
+        min_zscore: float = 2.0,
+    ) -> dict[str, Any]:
+        if lookback_bars <= 1:
+            raise ValueError("lookback_bars must be greater than one.")
+        histories, rejected = self._fetch_histories_for_symbols(
+            symbols,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            exchange=exchange,
+            instrument_type=instrument_type,
+        )
+        matches: list[dict[str, Any]] = []
+        for symbol in self._normalize_symbol_list(symbols):
+            df = histories.get(symbol)
+            if df is None:
+                continue
+            if len(df) <= lookback_bars:
+                rejected.append({"symbol": symbol, "reason": "insufficient_bars", "required_bars": lookback_bars + 1, "available_bars": int(len(df))})
+                continue
+            volume_series = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            latest_volume = float(volume_series.iloc[-1])
+            baseline_window = volume_series.iloc[-(lookback_bars + 1):-1]
+            average_volume = float(baseline_window.mean())
+            std_volume = float(baseline_window.std(ddof=0))
+            spike_ratio = round(latest_volume / average_volume, 4) if average_volume > 0 else None
+            zscore = round((latest_volume - average_volume) / std_volume, 4) if std_volume > 0 else None
+            row = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": str(df["timestamp"].iloc[-1]),
+                "latest_volume": latest_volume,
+                "average_volume": round(average_volume, 2),
+                "std_volume": round(std_volume, 2),
+                "spike_ratio": spike_ratio,
+                "zscore": zscore,
+                "strategy_match": bool((spike_ratio is not None and spike_ratio >= min_spike_ratio) or (zscore is not None and zscore >= min_zscore)),
+            }
+            if row["strategy_match"]:
+                matches.append(row)
+            else:
+                rejected.append({**row, "reason": "volume_not_unusual"})
+        matches.sort(
+            key=lambda row: (
+                row.get("zscore") if isinstance(row.get("zscore"), (int, float)) else float("-inf"),
+                row.get("spike_ratio") if isinstance(row.get("spike_ratio"), (int, float)) else float("-inf"),
+            ),
+            reverse=True,
+        )
+        return {
+            "data_source": "nubra",
+            "strategy": "unusual_volume",
+            "timeframe": timeframe,
+            "lookback_bars": lookback_bars,
+            "min_spike_ratio": min_spike_ratio,
+            "min_zscore": min_zscore,
+            "matches": matches,
+            "rejected": rejected,
+            "summary": {"match_count": len(matches), "rejected_count": len(rejected)},
+        }
+
+    def find_oi_build_up(
+        self,
+        symbols: list[str],
+        *,
+        exchange: str = "NSE",
+        expiry: str | None = None,
+        min_combined_oi_change_pct: float = 5.0,
+    ) -> dict[str, Any]:
+        matches: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for symbol in self._normalize_symbol_list(symbols):
+            try:
+                chain = self.option_chain(symbol, exchange=exchange, expiry=expiry)
+            except Exception as exc:
+                rejected.append({"symbol": symbol, "reason": "option_chain_fetch_failed", "details": str(exc)})
+                continue
+            atm = chain.get("atm")
+            calls = chain.get("calls") or []
+            puts = chain.get("puts") or []
+            call_leg = next((leg for leg in calls if leg.get("sp") == atm), None)
+            put_leg = next((leg for leg in puts if leg.get("sp") == atm), None)
+            if not call_leg or not put_leg:
+                rejected.append({"symbol": symbol, "reason": "atm_legs_missing", "expiry": chain.get("expiry")})
+                continue
+            call_prev = _to_float(call_leg.get("prev_oi"))
+            put_prev = _to_float(put_leg.get("prev_oi"))
+            call_oi = _to_float(call_leg.get("oi"))
+            put_oi = _to_float(put_leg.get("oi"))
+            call_change = round(call_oi - call_prev, 2)
+            put_change = round(put_oi - put_prev, 2)
+            combined_prev = call_prev + put_prev
+            combined_change = round(call_change + put_change, 2)
+            combined_change_pct = round((combined_change / combined_prev) * 100.0, 4) if combined_prev > 0 else None
+            if call_change > 0 and put_change > 0:
+                buildup_bias = "two_sided_build_up"
+            elif call_change > put_change:
+                buildup_bias = "call_heavy_build_up"
+            elif put_change > call_change:
+                buildup_bias = "put_heavy_build_up"
+            else:
+                buildup_bias = "mixed"
+            row = {
+                "symbol": symbol,
+                "expiry": chain.get("expiry"),
+                "atm": atm,
+                "atm_display": _format_rupees(atm),
+                "current_price": chain.get("current_price"),
+                "current_price_display": _format_rupees(chain.get("current_price")),
+                "call_ref_id": call_leg.get("ref_id"),
+                "put_ref_id": put_leg.get("ref_id"),
+                "call_oi_change": call_change,
+                "put_oi_change": put_change,
+                "combined_oi_change": combined_change,
+                "combined_oi_change_pct": combined_change_pct,
+                "call_iv": round(_to_float(call_leg.get("iv")), 6),
+                "put_iv": round(_to_float(put_leg.get("iv")), 6),
+                "combined_premium": round(_to_float(call_leg.get("ltp")) + _to_float(put_leg.get("ltp")), 2),
+                "combined_premium_display": _format_rupees(round(_to_float(call_leg.get("ltp")) + _to_float(put_leg.get("ltp")), 2)),
+                "build_up_bias": buildup_bias,
+                "strategy_match": bool(combined_change_pct is not None and combined_change_pct >= min_combined_oi_change_pct),
+            }
+            if row["strategy_match"]:
+                matches.append(row)
+            else:
+                rejected.append({**row, "reason": "combined_oi_change_below_threshold"})
+        matches.sort(key=lambda row: row.get("combined_oi_change_pct") or float("-inf"), reverse=True)
+        return {
+            "data_source": "nubra",
+            "strategy": "oi_build_up",
+            "min_combined_oi_change_pct": min_combined_oi_change_pct,
+            "matches": matches,
+            "rejected": rejected,
+            "summary": {"match_count": len(matches), "rejected_count": len(rejected)},
+        }
+
+    def find_iv_expansion(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str = "1d",
+        start_date: str = "",
+        end_date: str = "",
+        exchange: str = "NSE",
+        lookback_bars: int = 10,
+        min_expansion_ratio: float = 1.1,
+    ) -> dict[str, Any]:
+        option_symbols, instrument_to_underlying = self._resolve_atm_option_symbols(self._normalize_symbol_list(symbols), exchange=exchange)
+        if not option_symbols:
+            return {
+                "data_source": "nubra",
+                "strategy": "iv_expansion",
+                "matches": [],
+                "rejected": [{"symbol": symbol, "reason": "atm_option_resolution_failed"} for symbol in self._normalize_symbol_list(symbols)],
+                "summary": {"match_count": 0, "rejected_count": len(self._normalize_symbol_list(symbols))},
+            }
+
+        payload = self.historical_data(
+            option_symbols,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            exchange=exchange,
+            instrument_type="OPT",
+            fields=["iv_mid", "close"],
+            intraday=False,
+        )
+        series_by_symbol: dict[str, dict[str, dict[int, Any]]] = {}
+        for result in payload.get("result") or []:
+            for symbol_entry in result.get("values") or []:
+                if not isinstance(symbol_entry, dict):
+                    continue
+                symbol_name, series = next(iter(symbol_entry.items()))
+                series_by_symbol[symbol_name] = {
+                    field_name: _historical_series_to_map(field_points)
+                    for field_name, field_points in (series or {}).items()
+                }
+
+        grouped_rows: dict[str, list[dict[str, Any]]] = {}
+        rejected: list[dict[str, Any]] = []
+        for option_symbol, meta in instrument_to_underlying.items():
+            field_maps = series_by_symbol.get(option_symbol) or {}
+            iv_map = field_maps.get("iv_mid") or {}
+            if len(iv_map) <= lookback_bars:
+                rejected.append({"symbol": meta.get("underlying"), "option_symbol": option_symbol, "reason": "insufficient_iv_history"})
+                continue
+            ordered = sorted(iv_map.items(), key=lambda item: item[0])
+            iv_values = pd.Series([_to_float(value) for _, value in ordered], dtype="float64")
+            latest_iv = float(iv_values.iloc[-1])
+            baseline = float(iv_values.iloc[-(lookback_bars + 1):-1].mean())
+            expansion_ratio = round(latest_iv / baseline, 4) if baseline > 0 else None
+            grouped_rows.setdefault(str(meta.get("underlying")), []).append(
+                {
+                    "option_symbol": option_symbol,
+                    "option_type": meta.get("option_type"),
+                    "expiry": meta.get("expiry"),
+                    "atm_strike": meta.get("atm_strike"),
+                    "latest_iv": round(latest_iv, 6),
+                    "baseline_iv": round(baseline, 6),
+                    "expansion_ratio": expansion_ratio,
+                    "latest_timestamp": str(pd.Timestamp(ordered[-1][0], unit="ns", tz="UTC").tz_convert("Asia/Kolkata")),
+                }
+            )
+
+        matches: list[dict[str, Any]] = []
+        for symbol in self._normalize_symbol_list(symbols):
+            legs = grouped_rows.get(symbol) or []
+            if not legs:
+                continue
+            latest_iv = round(sum(_to_float(leg.get("latest_iv")) for leg in legs) / len(legs), 6)
+            baseline_iv = round(sum(_to_float(leg.get("baseline_iv")) for leg in legs) / len(legs), 6)
+            expansion_ratio = round(latest_iv / baseline_iv, 4) if baseline_iv > 0 else None
+            row = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "lookback_bars": lookback_bars,
+                "latest_avg_iv": latest_iv,
+                "baseline_avg_iv": baseline_iv,
+                "expansion_ratio": expansion_ratio,
+                "legs": legs,
+                "strategy_match": bool(expansion_ratio is not None and expansion_ratio >= min_expansion_ratio),
+            }
+            if row["strategy_match"]:
+                matches.append(row)
+            else:
+                rejected.append({**row, "reason": "iv_expansion_below_threshold"})
+        matches.sort(key=lambda row: row.get("expansion_ratio") or float("-inf"), reverse=True)
+        return {
+            "data_source": "nubra",
+            "strategy": "iv_expansion",
+            "timeframe": timeframe,
+            "lookback_bars": lookback_bars,
+            "min_expansion_ratio": min_expansion_ratio,
             "matches": matches,
             "rejected": rejected,
             "summary": {"match_count": len(matches), "rejected_count": len(rejected)},

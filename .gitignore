@@ -7,6 +7,7 @@ auth_state.json
 auth_data.db.*
 *.log
 artifacts/
+data/
 build/
 dist/
 dist_pypi/
